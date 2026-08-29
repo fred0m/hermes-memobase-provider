@@ -85,23 +85,25 @@ def _parse_num(s: str) -> Optional[int]:
 
 
 _STATIC_TEMPORAL_PATTERNS: List[Tuple[re.Pattern, int, int]] = [
-    (re.compile(r"今天|今晚|今早|今日"), 0, 1),
-    (re.compile(r"昨天|昨晚"), 1, 2),
-    (re.compile(r"前天"), 2, 3),
-    (re.compile(r"最近|近期|这几天|这阵子"), 0, 7),
-    (re.compile(r"这周|本周|这星期"), 0, 7),
-    (re.compile(r"上周|上星期"), 7, 14),
-    (re.compile(r"上个月|上月"), 30, 60),
+    # 离散日期差体系（今天=0，昨天=1）→ 单日窗收窄为精确闭区间（agy P1-3）
+    (re.compile(r"今天|今晚|今早|今日"), 0, 0),
+    (re.compile(r"昨天|昨晚"), 1, 1),
+    (re.compile(r"前天"), 2, 2),
+    (re.compile(r"最近|近期|这几天|这阵子"), 0, 6),
+    (re.compile(r"这周|本周|这星期"), 0, 6),
+    (re.compile(r"上周|上星期"), 7, 13),
+    (re.compile(r"上个月|上月"), 30, 59),
     (re.compile(r"今年|今年以来"), 0, 365),
 ]
 
 _DYNAMIC_TEMPORAL_PATTERNS: List[Tuple[re.Pattern, Callable[[int], Tuple[int, int]]]] = [
-    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*天前"), lambda n: (n, n + 1)),
-    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(?:星期|周)前"), lambda n: (n * 7, (n + 1) * 7)),
-    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:个)?月前"), lambda n: (n * 30, (n + 1) * 30)),
-    (re.compile(r"过去\s*(\d+|[一二两三四五六七八九十]+)\s*天"), lambda n: (0, n)),
-    (re.compile(r"过去\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(?:星期|周)"), lambda n: (0, n * 7)),
-    (re.compile(r"过去\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?月"), lambda n: (0, n * 30)),
+    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*天前"), lambda n: (n, n)),
+    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(?:星期|周)前"), lambda n: (n * 7, (n + 1) * 7 - 1)),
+    (re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:个)?月前"), lambda n: (n * 30, (n + 1) * 30 - 1)),
+    # agy P2-6：口语"这N天/这N周/这N月"与"过去N天"合并
+    (re.compile(r"(?:过去|这)\s*(\d+|[一二两三四五六七八九十]+)\s*天"), lambda n: (0, max(0, n - 1))),
+    (re.compile(r"(?:过去|这)\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(?:星期|周)"), lambda n: (0, max(0, n * 7 - 1))),
+    (re.compile(r"(?:过去|这)\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?月"), lambda n: (0, max(0, n * 30 - 1))),
 ]
 
 
@@ -165,16 +167,23 @@ _COMMON_UPPER_STOPWORDS = {
 
 _CJK_KNOWN = [
     "图图", "沫沫", "小爱", "爱音", "克拉拉", "岁岁", "潜潜", "纪纪", "灯灯",
-    "agy", "omp", "dockercenter", "chromebook", "hermes", "memobase",
-    "9router", "memobase-use", "qwen3-reranker-4b",
+]
+
+# 拉丁专名表：严格要求 \b 单词边界（agy P0-2：omp 子串匹配误报 prompt/company）
+_LATIN_KNOWN_RES = [
+    re.compile(r"\b" + re.escape(name) + r"\b", re.IGNORECASE)
+    for name in [
+        "agy", "omp", "dockercenter", "chromebook", "hermes", "memobase",
+        "9router", "memobase-use", "qwen3-reranker-4b",
+    ]
 ]
 
 _ENTITY_RES = [
     (re.compile(r"\b[\w.-]+\.(?:py|md|yaml|yml|json|ts|tsx|go|rs|toml|sh|sql)\b", re.IGNORECASE), "FILE"),
     (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "IP"),
     (re.compile(r"\b[\w-]+\.(?:com|cn|dev|io|ai|org|net)\b", re.IGNORECASE), "DOMAIN"),
-    (re.compile(r"\b[a-zA-Z0-9]+(?:[-_.][a-zA-Z0-9]+)+\b"), "IDENT"),
-    (re.compile(r"\b[A-Za-z][a-z]+(?:[A-Z][a-z]+)+\b"), "CAMEL"),
+    (re.compile(r"\b(?=.*[a-zA-Z])[a-zA-Z0-9]+(?:[-_.][a-zA-Z0-9]+)+\b"), "IDENT"),  # 至少含一个字母，防纯数字/金额（agy P1-4）
+    (re.compile(r"\b[A-Za-z]+(?:[A-Z][a-z]+)+\b"), "CAMEL"),  # 允许缩写开头（BM25Index/RRFScored，agy P2-7）
     (re.compile(r"[\u201c\"]([^\u201d\"\n]{2,24})[\u201d\"]"), "QUOTED"),
     (re.compile(r"\u300a([^\u300b\n]{2,24})\u300b"), "BOOK"),
 ]
@@ -205,6 +214,10 @@ def extract_entities(
     for name in _CJK_KNOWN:
         if name.lower() in text_lower:
             _add(name)
+
+    for pat in _LATIN_KNOWN_RES:
+        for m in pat.finditer(text):
+            _add(m.group(0))
 
     for pat, typ in _ENTITY_RES:
         if typ in ("QUOTED", "BOOK"):

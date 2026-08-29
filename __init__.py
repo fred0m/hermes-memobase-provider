@@ -259,9 +259,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             self._temporal_floor = 0.6
 
-        self._timezone = str(
-            cfg.get("timezone", os.environ.get("MEMOBASE_TIMEZONE", "Asia/Shanghai"))
-        )
+        # agy P2-5：空串回退 Asia/Shanghai
+        tz_str = (cfg.get("timezone") or os.environ.get("MEMOBASE_TIMEZONE") or "Asia/Shanghai").strip()
+        self._timezone = tz_str or "Asia/Shanghai"
         self._tz = get_timezone(self._timezone)
 
         # Entity boost config (P0-B)
@@ -517,8 +517,11 @@ class MemobaseMemoryProvider(MemoryProvider):
             if self._rerank_mode == "always":
                 use_rerank = True
             elif self._rerank_mode == "auto":
-                # P1: short query check (< 3 effective terms: latin + CJK chunks)
-                effective_terms = len(_LATIN_RE.findall(query)) + len(_CJK_RE.findall(query))
+                # P1: short query check — CJK 按字符数/2 折算（连续中文块算多个词），
+                # 防纯中文长句被误判为 1 个 term 而旁路门控（agy P0-1）
+                latin_count = len(_LATIN_RE.findall(query))
+                cjk_terms = sum(max(1, len(chunk) // 2) for chunk in _CJK_RE.findall(query))
+                effective_terms = latin_count + cjk_terms
                 if effective_terms < 3:
                     use_rerank = True
                     rr_metrics = {"short_query": float(effective_terms)}
