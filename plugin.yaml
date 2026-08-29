@@ -1,0 +1,3 @@
+name: memobase
+version: 1.0.0
+description: "Memobase — self-hosted user profile + event timeline memory backend, with automatic per-turn recall."
