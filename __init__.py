@@ -42,10 +42,16 @@ Secrets live in ``$HERMES_HOME/.env`` (or the environment):
 so the provider reads/writes the SAME store as the memobase MCP server.
 
 Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
-    prefetch_max_tokens   context size returned per turn (default 2000)
-    prefetch_wait_secs    how long prefetch blocks on a cold backend (5)
-    fill_window_events    always include the recent event window (true)
-    time_range_days       event window depth (default 180)
+    prefetch_max_tokens        context size returned per turn (default 2000)
+    prefetch_wait_secs         how long prefetch blocks on a cold backend (5)
+    fill_window_events         always include the recent event window (true)
+    time_range_days            event window depth (default 180)
+    temporal_boost_enabled     enable temporal boost on time-window queries (default true)
+    temporal_gain              in-window score multiplier (default 1.6)
+    temporal_half_life_days    exponential decay half life for out-of-window events (default 30)
+    temporal_floor             decay floor multiplier (default 0.6)
+    timezone                   local timezone for date-diff computation (default "Asia/Shanghai")
+    entity_boost_enabled       enable entity boost via inverted index RRF leg (default true)
 """  # noqa: E501
 
 from __future__ import annotations
@@ -58,19 +64,27 @@ import threading
 import time
 import urllib.parse
 import uuid
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 
 from .hybrid_retriever import (
+    _CJK_RE,
+    _LATIN_RE,
     EventStore,
+    extract_entities,
+    get_timezone,
     low_discrimination,
+    parse_created_at,
+    parse_time_window,
     rerank,
     rrf_fusion,
     rrf_fusion_scored,
+    temporal_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,6 +158,13 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._hybrid_keep = 10
         self._hybrid_event_budget_tokens = 900
         self._event_cache_ttl = 300.0
+        self._temporal_boost_enabled = True
+        self._temporal_gain = 1.6
+        self._temporal_half_life_days = 30.0
+        self._temporal_floor = 0.6
+        self._timezone = "Asia/Shanghai"
+        self._tz = get_timezone("Asia/Shanghai")
+        self._entity_boost_enabled = True
         self._rerank_enabled = True
         self._rerank_mode = "auto"  # auto | always | never
         self._rerank_model = "Qwen/Qwen3-Reranker-4B"
@@ -212,6 +233,42 @@ class MemobaseMemoryProvider(MemoryProvider):
             cfg.get("hybrid_event_budget_tokens", os.environ.get("MEMOBASE_HYBRID_EVENT_BUDGET", 900))
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
+
+        # Temporal boost config (P0-A)
+        self._temporal_boost_enabled = _as_bool(
+            cfg.get("temporal_boost_enabled", os.environ.get("MEMOBASE_TEMPORAL_ENABLED", True)), True
+        )
+        try:
+            self._temporal_gain = float(
+                cfg.get("temporal_gain", os.environ.get("MEMOBASE_TEMPORAL_GAIN", 1.6))
+            )
+        except (TypeError, ValueError):
+            self._temporal_gain = 1.6
+
+        try:
+            self._temporal_half_life_days = float(
+                cfg.get("temporal_half_life_days", os.environ.get("MEMOBASE_TEMPORAL_HALF_LIFE", 30.0))
+            )
+        except (TypeError, ValueError):
+            self._temporal_half_life_days = 30.0
+
+        try:
+            self._temporal_floor = float(
+                cfg.get("temporal_floor", os.environ.get("MEMOBASE_TEMPORAL_FLOOR", 0.6))
+            )
+        except (TypeError, ValueError):
+            self._temporal_floor = 0.6
+
+        self._timezone = str(
+            cfg.get("timezone", os.environ.get("MEMOBASE_TIMEZONE", "Asia/Shanghai"))
+        )
+        self._tz = get_timezone(self._timezone)
+
+        # Entity boost config (P0-B)
+        self._entity_boost_enabled = _as_bool(
+            cfg.get("entity_boost_enabled", os.environ.get("MEMOBASE_ENTITY_ENABLED", True)), True
+        )
+
         self._rerank_enabled = _as_bool(
             cfg.get("rerank_enabled", os.environ.get("MEMOBASE_RERANK_ENABLED", True)), True
         )
@@ -402,8 +459,55 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._store.refresh()
         bm25_ids = self._store.bm25_top(query, topk=self._hybrid_bm25_topk)
 
-        # --- RRF fusion (both legs share the event id space) ---
-        fused_scored = rrf_fusion_scored([vec_ids, bm25_ids])
+        # --- Entity leg: local inverted index over entities (P0-B) ---
+        entity_ids: List[str] = []
+        if self._entity_boost_enabled and self._store is not None:
+            try:
+                entity_ids = self._store.entity_leg(query, topk=self._hybrid_bm25_topk)
+                if entity_ids:
+                    logger.debug("[memobase] entity leg hits: %d docs", len(entity_ids))
+            except Exception as exc:
+                logger.warning("[memobase] entity leg error, fallback to empty: %s", exc)
+                entity_ids = []
+
+        # --- RRF fusion (all legs share the event id space) ---
+        fused_scored = rrf_fusion_scored([vec_ids, bm25_ids, entity_ids])
+        raw_fused_scored = fused_scored
+
+        # --- Temporal boost (P0-A) ---
+        if self._temporal_boost_enabled and self._store is not None:
+            try:
+                window = parse_time_window(query)
+                if window:
+                    now_date = datetime.now(self._tz).date()
+                    boosted: List[Tuple[str, float]] = []
+                    for eid, s in fused_scored:
+                        t = self._store.time_for(eid)
+                        if t is not None:
+                            try:
+                                ev_date = datetime.fromtimestamp(t, tz=self._tz).date()
+                                age_days = float((now_date - ev_date).days)
+                                f = temporal_factor(
+                                    age_days,
+                                    window,
+                                    gain=self._temporal_gain,
+                                    half_life_days=self._temporal_half_life_days,
+                                    floor=self._temporal_floor,
+                                )
+                            except Exception:
+                                f = 1.0
+                        else:
+                            f = 1.0
+                        boosted.append((eid, s * f))
+                    boosted.sort(key=lambda kv: kv[1], reverse=True)
+                    fused_scored = boosted
+                    logger.info(
+                        "[memobase] temporal boost applied (window=%s, gain=%.2f, candidates=%d)",
+                        window, self._temporal_gain, len(boosted),
+                    )
+            except Exception as exc:
+                logger.warning("[memobase] temporal boost error, skip: %s", exc)
+
         fused = [eid for eid, _ in fused_scored]
         text_map = {eid: txt for eid, txt in vec_hits}
 
@@ -413,19 +517,26 @@ class MemobaseMemoryProvider(MemoryProvider):
             if self._rerank_mode == "always":
                 use_rerank = True
             elif self._rerank_mode == "auto":
-                use_rerank, rr_metrics = low_discrimination(
-                    vec_ids,
-                    bm25_ids,
-                    fused_scored,
-                    vec_sims,
-                    ratio_threshold=self._rerank_ratio_threshold,
-                    overlap_threshold=self._rerank_overlap_threshold,
-                    sim_threshold=self._rerank_sim_threshold,
-                )
-                if use_rerank:
-                    logger.info("[memobase] rerank auto-triggered (metrics=%s)", rr_metrics)
+                # P1: short query check (< 3 effective terms: latin + CJK chunks)
+                effective_terms = len(_LATIN_RE.findall(query)) + len(_CJK_RE.findall(query))
+                if effective_terms < 3:
+                    use_rerank = True
+                    rr_metrics = {"short_query": float(effective_terms)}
+                    logger.info("[memobase] rerank auto-triggered (short_query=%d)", effective_terms)
                 else:
-                    logger.debug("[memobase] rerank skipped (metrics=%s)", rr_metrics)
+                    use_rerank, rr_metrics = low_discrimination(
+                        vec_ids,
+                        bm25_ids,
+                        raw_fused_scored,
+                        vec_sims,
+                        ratio_threshold=self._rerank_ratio_threshold,
+                        overlap_threshold=self._rerank_overlap_threshold,
+                        sim_threshold=self._rerank_sim_threshold,
+                    )
+                    if use_rerank:
+                        logger.info("[memobase] rerank auto-triggered (metrics=%s)", rr_metrics)
+                    else:
+                        logger.debug("[memobase] rerank skipped (metrics=%s)", rr_metrics)
         if use_rerank:
             cand_ids = fused[: self._rerank_topk]
             cand_pairs = []
