@@ -249,8 +249,12 @@ _LATIN_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]+")
 # 中文单字停用词（虚词/代词/助词）——文档侧 unigram 过滤，bigram 保留
 _CJK_STOPWORDS = frozenset(
-    "的了是在和有我你他她它这那就都而及与着或个们把被让对从向为以于"
+    "的了是在和有我你他她它这那就都而及与着或个们把被让对从向为以于只条点么吗"
 )
+# 通用英文高频词——排除 latin boost（agy P1-1：app/api/json 不该抢中文核心词权重）
+_LATIN_STOPWORDS = frozenset(
+    w.lower() for w in _COMMON_UPPER_STOPWORDS
+) | {"app", "api", "web", "url", "uri", "http", "json", "post", "get", "the", "and", "for", "with"}
 
 
 def tokenize(text: str, query_mode: bool = False) -> List[str]:
@@ -364,7 +368,8 @@ class BM25Index:
             df = self._df[term]
             idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
             # latin/number exact tokens are the strongest keyword signal
-            if _LATIN_RE.fullmatch(term):
+            # (exclude generic english words — agy P1-1)
+            if _LATIN_RE.fullmatch(term) and term not in _LATIN_STOPWORDS:
                 idf *= 1.5
             for di, tf in posting:
                 dl = self._doc_len[di]
