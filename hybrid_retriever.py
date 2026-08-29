@@ -247,10 +247,21 @@ def extract_entities(
 _LATIN_RE = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", re.IGNORECASE)
 # Contiguous CJK runs (ideographs only — no CJK punctuation).
 _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]+")
+# 中文单字停用词（虚词/代词/助词）——文档侧 unigram 过滤，bigram 保留
+_CJK_STOPWORDS = frozenset(
+    "的了是在和有我你他她它这那就都而及与着或个们把被让对从向为以于"
+)
 
 
-def tokenize(text: str) -> List[str]:
-    """CJK unigram+bigram (per contiguous chunk) + latin words. Lowercased."""
+def tokenize(text: str, query_mode: bool = False) -> List[str]:
+    """CJK unigram+bigram (per contiguous chunk) + latin words. Lowercased.
+
+    query_mode=True: CJK chunks of len>=2 emit **bigrams only** — unigrams
+    are high-df noise for short queries (生日/模型 match almost every doc);
+    single-char chunks fall back to unigram. Document side keeps unigram+bigram
+    so recall is preserved, but single-char stopwords (的/是/了) are dropped
+    from the index to cut noise.
+    """
     if not text:
         return []
     tokens: List[str] = []
@@ -262,12 +273,19 @@ def tokenize(text: str) -> List[str]:
     for chunk in _CJK_RE.findall(t):
         n = len(chunk)
         if n == 1:
-            tokens.append(chunk)
+            if chunk not in _CJK_STOPWORDS:
+                tokens.append(chunk)
             continue
-        # unigrams + bigrams
-        tokens.extend(chunk)
-        for i in range(n - 1):
-            tokens.append(chunk[i : i + 2])
+        if query_mode:
+            # bigrams only — unigrams are high-df noise for queries
+            for i in range(n - 1):
+                tokens.append(chunk[i : i + 2])
+        else:
+            for ch in chunk:
+                if ch not in _CJK_STOPWORDS:
+                    tokens.append(ch)
+            for i in range(n - 1):
+                tokens.append(chunk[i : i + 2])
     return tokens
 
 
@@ -325,10 +343,16 @@ class BM25Index:
         return self._built
 
     def score(self, query: str) -> List[Tuple[int, float]]:
-        """Return [(doc_idx, bm25_score)] for documents with any overlap."""
+        """Return [(doc_idx, bm25_score)] for documents with any overlap.
+
+        Query side uses query_mode tokenization (CJK bigrams only) to cut
+        high-df unigram noise; latin/number tokens get an idf boost since
+        exact identifiers (9router, memobase-use, GOALS.md) are the strongest
+        keyword signal.
+        """
         if not self._built or not self._postings:
             return []
-        q_terms = set(tokenize(query))
+        q_terms = set(tokenize(query, query_mode=True))
         if not q_terms:
             return []
         n = len(self._docs)
@@ -339,6 +363,9 @@ class BM25Index:
                 continue
             df = self._df[term]
             idf = math.log(1.0 + (n - df + 0.5) / (df + 0.5))
+            # latin/number exact tokens are the strongest keyword signal
+            if _LATIN_RE.fullmatch(term):
+                idf *= 1.5
             for di, tf in posting:
                 dl = self._doc_len[di]
                 denom = (
