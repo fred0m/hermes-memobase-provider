@@ -64,9 +64,9 @@ import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
@@ -133,6 +133,16 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _cfg_int(value: Any, default: int = 0) -> int:
+    """Safe int parsing — None/empty string fallback to default."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class MemobaseMemoryProvider(MemoryProvider):
     """MemoryProvider implementation backed by a self-hosted Memobase server."""
 
@@ -157,6 +167,12 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._hybrid_bm25_topk = 20
         self._hybrid_keep = 10
         self._hybrid_event_budget_tokens = 900
+        # Summary layer config (FR-010)
+        self._summary_enabled = False
+        self._summary_budget_tokens = 350
+        self._event_budget_tokens = 850
+        self._summary_topk = 2
+        self._summary_semantic_topk = 3
         self._event_cache_ttl = 300.0
         self._temporal_boost_enabled = True
         self._temporal_gain = 1.6
@@ -229,8 +245,29 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._hybrid_keep = int(
             cfg.get("hybrid_keep", os.environ.get("MEMOBASE_HYBRID_KEEP", 10))
         )
-        self._hybrid_event_budget_tokens = int(
-            cfg.get("hybrid_event_budget_tokens", os.environ.get("MEMOBASE_HYBRID_EVENT_BUDGET", 900))
+        # Summary layer configs (FR-010 / FR-014)
+        self._summary_enabled = _as_bool(
+            cfg.get("summary_enabled", os.environ.get("MEMOBASE_SUMMARY_ENABLED", False)), False
+        )
+        self._summary_budget_tokens = _cfg_int(
+            cfg.get("summary_budget_tokens", os.environ.get("MEMOBASE_SUMMARY_BUDGET_TOKENS", 350)), 350
+        )
+        self._event_budget_tokens = _cfg_int(
+            cfg.get(
+                "event_budget_tokens",
+                os.environ.get(
+                    "MEMOBASE_EVENT_BUDGET_TOKENS",
+                    cfg.get("hybrid_event_budget_tokens", os.environ.get("MEMOBASE_HYBRID_EVENT_BUDGET", 850)),
+                ),
+            ),
+            850,
+        )
+        self._hybrid_event_budget_tokens = self._event_budget_tokens
+        self._summary_topk = _cfg_int(
+            cfg.get("summary_topk", os.environ.get("MEMOBASE_SUMMARY_TOPK", 2)), 2
+        )
+        self._summary_semantic_topk = _cfg_int(
+            cfg.get("summary_semantic_topk", os.environ.get("MEMOBASE_SUMMARY_SEMANTIC_TOPK", 3)), 3
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
 
@@ -290,17 +327,8 @@ class MemobaseMemoryProvider(MemoryProvider):
             cfg.get("rerank_ratio_threshold", os.environ.get("MEMOBASE_RERANK_RATIO", 1.01))
         )
         # P1-3 防御：None/空串不崩溃，int 解析失败回退默认
-        def _cfg_int(key, env_var, default):
-            v = cfg.get(key)
-            if v is None:
-                v = os.environ.get(env_var, default)
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return default
-
-        self._rerank_topk = _cfg_int("rerank_topk", "MEMOBASE_RERANK_TOPK", 15)
-        self._rerank_keep = _cfg_int("rerank_keep", "MEMOBASE_RERANK_KEEP", 8)
+        self._rerank_topk = _cfg_int(cfg.get("rerank_topk", os.environ.get("MEMOBASE_RERANK_TOPK", 15)), 15)
+        self._rerank_keep = _cfg_int(cfg.get("rerank_keep", os.environ.get("MEMOBASE_RERANK_KEEP", 8)), 8)
         self._rerank_overlap_threshold = float(
             cfg.get("rerank_overlap_threshold", os.environ.get("MEMOBASE_RERANK_OVERLAP", 0.3))
         )
@@ -349,8 +377,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         return (
             "You have access to a Memobase long-term memory backend. "
             "Relevant memories are injected automatically each turn inside the "
-            "`<memory-context>` block. You can also search on demand with the "
-            "`memobase_search` tool, or list the full user profile with "
+            "`<memory-context>` block. "
+            "Recent summaries come from daily memory compression; if you need specific event details, use `memobase_search` with the `date` parameter (YYYY-MM-DD). "
+            "You can also search on demand with the `memobase_search` tool, or list the full user profile with "
             "`memobase_profile`."
         )
 
@@ -418,6 +447,83 @@ class MemobaseMemoryProvider(MemoryProvider):
             logger.warning("[memobase] hybrid recall failed, fallback to vector: %s", exc)
             return self._call_context_vector(query)
 
+    def _fetch_summaries_dual_path(
+        self, query: str, time_window: Optional[Tuple[int, int]]
+    ) -> List[Dict[str, Any]]:
+        """FR-011: 双路检索概要文档（语义路 + 时间直通路），去重合并后返回最多 summary_topk 个。"""
+        if self._client is None or self._user_id is None:
+            return []
+
+        direct_summaries: List[Dict[str, Any]] = []
+        semantic_summaries: List[Dict[str, Any]] = []
+
+        # 1. 直通路 (b): parse_time_window 换算为日期范围
+        if time_window is not None:
+            try:
+                min_age, max_age = time_window
+                now_date = datetime.now(self._tz).date()
+                end_d = now_date - timedelta(days=min_age)
+                start_d = now_date - timedelta(days=max_age)
+                if start_d > end_d:
+                    start_d, end_d = end_d, start_d
+                r_direct = self._client.get(
+                    f"/users/summary/{self._user_id}",
+                    params={
+                        "start_date": start_d.strftime("%Y-%m-%d"),
+                        "end_date": end_d.strftime("%Y-%m-%d"),
+                        "kind": "daily",
+                    },
+                )
+                r_direct.raise_for_status()
+                d_data = r_direct.json()
+                if not d_data.get("errno", 0):
+                    s_list = (d_data.get("data") or {}).get("summaries") or []
+                    # 按日期倒序排（最近日期优先）
+                    direct_summaries = sorted(
+                        s_list,
+                        key=lambda s: str(s.get("summary_date", "")),
+                        reverse=True,
+                    )
+            except Exception as exc:
+                logger.warning("[memobase] direct summary retrieval error: %s", exc)
+                direct_summaries = []
+
+        # 2. 语义路 (a): GET /users/summary/search/{uid}
+        try:
+            r_sem = self._client.get(
+                f"/users/summary/search/{self._user_id}",
+                params={
+                    "query": query,
+                    "topk": str(self._summary_semantic_topk),
+                    "kind": "daily",
+                },
+            )
+            r_sem.raise_for_status()
+            sem_data = r_sem.json()
+            if not sem_data.get("errno", 0):
+                semantic_summaries = (sem_data.get("data") or {}).get("summaries") or []
+        except Exception as exc:
+            logger.warning("[memobase] semantic summary search error: %s", exc)
+            semantic_summaries = []
+
+        # 3. 按 summary_date 去重合并：直通路优先保时间命中，再补语义路命中
+        merged: List[Dict[str, Any]] = []
+        seen_dates: Set[str] = set()
+
+        for s in direct_summaries:
+            s_date = str(s.get("summary_date", "")).strip()
+            if s_date and s_date not in seen_dates:
+                seen_dates.add(s_date)
+                merged.append(s)
+
+        for s in semantic_summaries:
+            s_date = str(s.get("summary_date", "")).strip()
+            if s_date and s_date not in seen_dates:
+                seen_dates.add(s_date)
+                merged.append(s)
+
+        return merged[: self._summary_topk]
+
     def _call_context_hybrid(self, query: str) -> str:
         """Run BM25 + vector legs, fuse with RRF, rebuild the event section.
 
@@ -429,6 +535,67 @@ class MemobaseMemoryProvider(MemoryProvider):
         if self._client is None or self._user_id is None:
             return ""
         query = query[:_MAX_QUERY_CHARS]
+
+        # FR-012: 一次性解析时间窗，直通路与事件腿 temporal boost 共用
+        time_window = parse_time_window(query)
+
+        # 共享跨段行级去重集合 (FR-015)
+        seen_lines: Set[str] = set()
+        summary_lines: List[str] = []
+        used_summary = 0
+
+        # FR-011 / FR-013 / FR-016: 文档段组装（flag 开启时执行，异常 fail-open）
+        if self._summary_enabled:
+            try:
+                summaries = self._fetch_summaries_dual_path(query, time_window)
+                for doc in summaries:
+                    d_str = str(doc.get("summary_date", "")).strip()
+                    if not d_str:
+                        continue
+                    try:
+                        dt = datetime.strptime(d_str, "%Y-%m-%d").date()
+                        m_d = f"{dt.month}/{dt.day}"
+                    except Exception:
+                        m_d = d_str
+
+                    eids = doc.get("event_ids") or []
+                    n_events = len(eids)
+                    header_line = f"【{m_d} 概要】（当日 {n_events} 事件，细节可查 memobase_search date={d_str}）"
+
+                    if used_summary + len(header_line) > self._summary_budget_tokens and summary_lines:
+                        break
+                    summary_lines.append(header_line)
+                    used_summary += len(header_line)
+
+                    # 概要 content 行级渲染 (FR-013)
+                    content = doc.get("content") or ""
+                    strip_chars = "-*• \t"
+                    for ln in content.splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        disp = f"- {ln.lstrip(strip_chars)}"
+                        if disp in seen_lines:
+                            continue
+                        seen_lines.add(disp)
+                        if used_summary + len(disp) > self._summary_budget_tokens and summary_lines:
+                            break
+                        summary_lines.append(disp)
+                        used_summary += len(disp)
+            except Exception as exc:
+                logger.warning("[memobase] summary segment build failed, fail-open: %s", exc)
+                summary_lines = []
+                used_summary = 0
+
+        # FR-014 / FR-016: 事件段预算与让渡逻辑
+        if self._summary_enabled:
+            if summary_lines:
+                event_budget = self._event_budget_tokens
+            else:
+                # 概要段无命中或异常，预算让渡给事件段
+                event_budget = self._event_budget_tokens + self._summary_budget_tokens
+        else:
+            event_budget = self._event_budget_tokens
 
         # --- vector leg: event-level semantic search (event ids) ---
         vec_hits: List[Tuple[str, str]] = []
@@ -474,37 +641,35 @@ class MemobaseMemoryProvider(MemoryProvider):
         fused_scored = rrf_fusion_scored([vec_ids, bm25_ids, entity_ids])
         raw_fused_scored = fused_scored
 
-        # --- Temporal boost (P0-A) ---
-        if self._temporal_boost_enabled and self._store is not None:
+        # --- Temporal boost (P0-A, FR-012: 共用 time_window) ---
+        if self._temporal_boost_enabled and self._store is not None and time_window is not None:
             try:
-                window = parse_time_window(query)
-                if window:
-                    now_date = datetime.now(self._tz).date()
-                    boosted: List[Tuple[str, float]] = []
-                    for eid, s in fused_scored:
-                        t = self._store.time_for(eid)
-                        if t is not None:
-                            try:
-                                ev_date = datetime.fromtimestamp(t, tz=self._tz).date()
-                                age_days = float((now_date - ev_date).days)
-                                f = temporal_factor(
-                                    age_days,
-                                    window,
-                                    gain=self._temporal_gain,
-                                    half_life_days=self._temporal_half_life_days,
-                                    floor=self._temporal_floor,
-                                )
-                            except Exception:
-                                f = 1.0
-                        else:
+                now_date = datetime.now(self._tz).date()
+                boosted: List[Tuple[str, float]] = []
+                for eid, s in fused_scored:
+                    t = self._store.time_for(eid)
+                    if t is not None:
+                        try:
+                            ev_date = datetime.fromtimestamp(t, tz=self._tz).date()
+                            age_days = float((now_date - ev_date).days)
+                            f = temporal_factor(
+                                age_days,
+                                time_window,
+                                gain=self._temporal_gain,
+                                half_life_days=self._temporal_half_life_days,
+                                floor=self._temporal_floor,
+                            )
+                        except Exception:
                             f = 1.0
-                        boosted.append((eid, s * f))
-                    boosted.sort(key=lambda kv: kv[1], reverse=True)
-                    fused_scored = boosted
-                    logger.info(
-                        "[memobase] temporal boost applied (window=%s, gain=%.2f, candidates=%d)",
-                        window, self._temporal_gain, len(boosted),
-                    )
+                    else:
+                        f = 1.0
+                    boosted.append((eid, s * f))
+                boosted.sort(key=lambda kv: kv[1], reverse=True)
+                fused_scored = boosted
+                logger.info(
+                    "[memobase] temporal boost applied (window=%s, gain=%.2f, candidates=%d)",
+                    time_window, self._temporal_gain, len(boosted),
+                )
             except Exception as exc:
                 logger.warning("[memobase] temporal boost error, skip: %s", exc)
 
@@ -583,11 +748,12 @@ class MemobaseMemoryProvider(MemoryProvider):
             if len(rows) >= self._hybrid_keep:
                 break
         if not rows:
+            if summary_lines:
+                return self._finalize_hybrid(query, [], summary_lines)
             return self._call_context_vector(query)
 
         # --- rebuild event section under the token budget (line-level dedupe) ---
         lines: List[str] = []
-        seen_lines: set = set()
         used = 0
         for _eid, txt in rows:
             for ln in txt.splitlines():
@@ -599,24 +765,36 @@ class MemobaseMemoryProvider(MemoryProvider):
                 if disp in seen_lines:
                     continue
                 seen_lines.add(disp)
-                if used + len(disp) > self._hybrid_event_budget_tokens and lines:
-                    return self._finalize_hybrid(query, lines)
+                if used + len(disp) > event_budget and lines:
+                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
                 lines.append(disp)
                 used += len(disp)
-        return self._finalize_hybrid(query, lines)
+        return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
 
     _EVENT_HEADER_RE = re.compile(r"## (?:过去事件|Past Events|Events)[：:]?\s*")
 
-    def _finalize_hybrid(self, query: str, lines: List[str]) -> str:
+    def _finalize_hybrid(
+        self,
+        query: str,
+        lines: List[str],
+        summary_lines: Optional[List[str]] = None,
+    ) -> str:
         """Attach the mixed event section to the vector context's profile part."""
         logger.info(
-            "[memobase] hybrid recall OK: %d event lines (query=%s...)",
+            "[memobase] hybrid recall OK: %d summary lines, %d event lines (query=%s...)",
+            len(summary_lines or []),
             len(lines),
             query[:30],
         )
         base = self._call_context_vector(query, _with_events=False)
         head = self._EVENT_HEADER_RE.split(base, maxsplit=1)[0]
-        new_ctx = f"{head}## 过去事件：\n" + "\n".join(lines)
+        summary_part = ""
+        if summary_lines:
+            summary_part = "## 近期概要：\n" + "\n".join(summary_lines) + "\n\n"
+        event_part = ""
+        if lines:
+            event_part = "## 过去事件：\n" + "\n".join(lines)
+        new_ctx = f"{head}{summary_part}{event_part}"
         self._record_success()
         return new_ctx.strip()
 
@@ -753,6 +931,10 @@ class MemobaseMemoryProvider(MemoryProvider):
                             "type": "string",
                             "description": "Natural-language search query.",
                         },
+                        "date": {
+                            "type": "string",
+                            "description": "Optional date in YYYY-MM-DD format to retrieve all raw event details for that day.",
+                        },
                         "max_length": {
                             "type": "integer",
                             "description": "Max context characters (default 2000).",
@@ -774,9 +956,49 @@ class MemobaseMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         if tool_name == "memobase_search":
             query = (args or {}).get("query", "")
+            date_arg = (args or {}).get("date")
             max_len = int((args or {}).get("max_length", 2000))
             if self._breaker_open():
                 return json.dumps({"error": "Memobase temporarily unavailable"}, ensure_ascii=False)
+
+            # FR-017: 带 date 参数时从 EventStore 本地按日过滤
+            if date_arg:
+                try:
+                    target_date = datetime.strptime(str(date_arg).strip(), "%Y-%m-%d").date()
+                    if self._store is None and self._client is not None and self._user_id is not None:
+                        self._store = EventStore(self._client, self._user_id, ttl_secs=self._event_cache_ttl)
+
+                    if self._store is not None:
+                        self._store.refresh()
+                        events_for_date = self._store.events_for_date(target_date, tz=self._tz)
+                    else:
+                        events_for_date = []
+
+                    if not events_for_date:
+                        return json.dumps(
+                            {"note": f"No events found for date {date_arg}."},
+                            ensure_ascii=False,
+                        )
+
+                    lines = []
+                    strip_chars = "-*• \t"
+                    for _, txt in events_for_date:
+                        for ln in txt.splitlines():
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            disp = f"- {ln.lstrip(strip_chars)}"
+                            lines.append(disp)
+
+                    ctx = f"## {date_arg} 事件细节（共 {len(events_for_date)} 条事件）：\n" + "\n".join(lines)
+                    if max_len and len(ctx) > max_len:
+                        ctx = ctx[:max_len]
+                    return json.dumps({"context": ctx}, ensure_ascii=False)
+                except Exception as exc:
+                    logger.warning("[memobase] memobase_search with date failed: %s", exc)
+                    return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+            # 不带 date 参数时行为与 v3 逐字节一致
             try:
                 ctx = self._call_context(query)
                 if max_len and len(ctx) > max_len:

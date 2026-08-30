@@ -606,6 +606,22 @@ class EventStore:
         with self._lock:
             return self._times.get(eid)
 
+    def events_for_date(self, target_date: Any, tz: Optional[datetime.tzinfo] = None) -> List[Tuple[str, str]]:
+        """Return all (eid, text) pairs on target_date in chronological (ascending) order."""
+        with self._lock:
+            matching: List[Tuple[float, str, str]] = []
+            for eid, t in self._times.items():
+                try:
+                    ev_date = datetime.fromtimestamp(t, tz=tz).date() if tz else datetime.fromtimestamp(t).date()
+                    if ev_date == target_date:
+                        txt = self._texts.get(eid)
+                        if txt:
+                            matching.append((t, eid, txt))
+                except Exception:
+                    continue
+            matching.sort(key=lambda x: x[0])
+            return [(eid, txt) for _, eid, txt in matching]
+
     def bm25_top(self, query: str, topk: int = 20) -> List[str]:
         with self._lock:
             if not self._index.is_built:
