@@ -75,6 +75,7 @@ from agent.memory_provider import MemoryProvider, RecallStatus
 from .hybrid_retriever import (
     _CJK_RE,
     _LATIN_RE,
+    BM25Index,
     EventStore,
     extract_entities,
     get_timezone,
@@ -268,6 +269,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         )
         self._summary_semantic_topk = _cfg_int(
             cfg.get("summary_semantic_topk", os.environ.get("MEMOBASE_SUMMARY_SEMANTIC_TOPK", 3)), 3
+        )
+        self._summary_single_day_budget = _cfg_int(
+            cfg.get("summary_single_day_budget", os.environ.get("MEMOBASE_SUMMARY_SINGLE_DAY_BUDGET", 700)), 700
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
 
@@ -548,6 +552,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         if self._summary_enabled:
             try:
                 summaries = self._fetch_summaries_dual_path(query, time_window)
+                # 单日窗预算放宽（Q5-1：直通只命中 1 天时 350 明显不够，30 事件 ≈1500+ 字符）
+                single_day = time_window is not None and (time_window[1] - time_window[0]) <= 1
+                summary_budget = self._summary_single_day_budget if single_day else self._summary_budget_tokens
                 for doc in summaries:
                     d_str = str(doc.get("summary_date", "")).strip()
                     if not d_str:
@@ -562,14 +569,15 @@ class MemobaseMemoryProvider(MemoryProvider):
                     n_events = len(eids)
                     header_line = f"【{m_d} 概要】（当日 {n_events} 事件，细节可查 memobase_search date={d_str}）"
 
-                    if used_summary + len(header_line) > self._summary_budget_tokens and summary_lines:
+                    if used_summary + len(header_line) > summary_budget and summary_lines:
                         break
                     summary_lines.append(header_line)
                     used_summary += len(header_line)
 
-                    # 概要 content 行级渲染 (FR-013)
+                    # 概要 content 行级渲染 (FR-013) + 行级 BM25 排序（Q5-1：#21 截断正解）
                     content = doc.get("content") or ""
                     strip_chars = "-*• \t"
+                    raw_lines = []
                     for ln in content.splitlines():
                         ln = ln.strip()
                         if not ln:
@@ -577,8 +585,18 @@ class MemobaseMemoryProvider(MemoryProvider):
                         disp = f"- {ln.lstrip(strip_chars)}"
                         if disp in seen_lines:
                             continue
+                        raw_lines.append(disp)
+                    if len(raw_lines) > 1:
+                        try:
+                            bm = BM25Index()
+                            bm.build(raw_lines)
+                            scored = bm.score(query)
+                            raw_lines = [raw_lines[i] for i, _ in sorted(scored, key=lambda kv: -kv[1])]
+                        except Exception:
+                            pass  # BM25 排序失败保持原序（fail-open）
+                    for disp in raw_lines:
                         seen_lines.add(disp)
-                        if used_summary + len(disp) > self._summary_budget_tokens and summary_lines:
+                        if used_summary + len(disp) > summary_budget and summary_lines:
                             break
                         summary_lines.append(disp)
                         used_summary += len(disp)
