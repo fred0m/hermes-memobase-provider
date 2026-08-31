@@ -591,7 +591,9 @@ class MemobaseMemoryProvider(MemoryProvider):
                             bm = BM25Index()
                             bm.build(raw_lines)
                             scored = bm.score(query)
-                            raw_lines = [raw_lines[i] for i, _ in sorted(scored, key=lambda kv: -kv[1])]
+                            if scored:
+                                raw_lines = [raw_lines[i] for i, _ in sorted(scored, key=lambda kv: -kv[1])]
+                            # scored 为空（查询词与概要行无 bigram 重叠）保持原序，防内容行全丢
                         except Exception:
                             pass  # BM25 排序失败保持原序（fail-open）
                     for disp in raw_lines:
