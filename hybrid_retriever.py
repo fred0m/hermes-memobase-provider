@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -606,9 +606,26 @@ class EventStore:
         with self._lock:
             return self._times.get(eid)
 
+    def date_for(self, eid: str, tz: Optional[datetime.tzinfo] = None) -> Optional[str]:
+        """Return YYYY-MM-DD date string for event in the given timezone, or None."""
+        with self._lock:
+            t = self._times.get(eid)
+            if t is None:
+                return None
+            try:
+                dt = datetime.fromtimestamp(t, tz=tz) if tz else datetime.fromtimestamp(t)
+                return dt.strftime("%Y-%m-%d")
+            except Exception:
+                return None
+
     def events_for_date(self, target_date: Any, tz: Optional[datetime.tzinfo] = None) -> List[Tuple[str, str]]:
         """Return all (eid, text) pairs on target_date in chronological (ascending) order."""
         with self._lock:
+            if isinstance(target_date, str):
+                try:
+                    target_date = datetime.strptime(target_date.strip(), "%Y-%m-%d").date()
+                except Exception:
+                    return []
             matching: List[Tuple[float, str, str]] = []
             for eid, t in self._times.items():
                 try:

@@ -52,6 +52,10 @@ Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
     temporal_floor             decay floor multiplier (default 0.6)
     timezone                   local timezone for date-diff computation (default "Asia/Shanghai")
     entity_boost_enabled       enable entity boost via inverted index RRF leg (default true)
+    anchor_backfill_enabled    enable anchor backfill injection on pure semantic queries (default true)
+    anchor_topk                number of anchor dates to extract from semantic summaries (default 2)
+    anchor_events_per_day      max events to inject per missing anchor date (default 2)
+    anchor_budget_tokens       max budget cap for anchor backfill lines (default 200)
 """  # noqa: E501
 
 from __future__ import annotations
@@ -174,6 +178,11 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._event_budget_tokens = 850
         self._summary_topk = 2
         self._summary_semantic_topk = 3
+        # Anchor backfill config (FR-019)
+        self._anchor_backfill_enabled = True
+        self._anchor_topk = 2
+        self._anchor_events_per_day = 2
+        self._anchor_budget_tokens = 200
         self._event_cache_ttl = 300.0
         self._temporal_boost_enabled = True
         self._temporal_gain = 1.6
@@ -272,6 +281,19 @@ class MemobaseMemoryProvider(MemoryProvider):
         )
         self._summary_single_day_budget = _cfg_int(
             cfg.get("summary_single_day_budget", os.environ.get("MEMOBASE_SUMMARY_SINGLE_DAY_BUDGET", 700)), 700
+        )
+        # Anchor backfill config (FR-019)
+        self._anchor_backfill_enabled = _as_bool(
+            cfg.get("anchor_backfill_enabled", os.environ.get("MEMOBASE_ANCHOR_ENABLED", True)), True
+        )
+        self._anchor_topk = _cfg_int(
+            cfg.get("anchor_topk", os.environ.get("MEMOBASE_ANCHOR_TOPK", 2)), 2
+        )
+        self._anchor_events_per_day = _cfg_int(
+            cfg.get("anchor_events_per_day", os.environ.get("MEMOBASE_ANCHOR_EVENTS_PER_DAY", 2)), 2
+        )
+        self._anchor_budget_tokens = _cfg_int(
+            cfg.get("anchor_budget_tokens", os.environ.get("MEMOBASE_ANCHOR_BUDGET_TOKENS", 200)), 200
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
 
@@ -547,6 +569,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         seen_lines: Set[str] = set()
         summary_lines: List[str] = []
         used_summary = 0
+        summaries: List[Dict[str, Any]] = []
 
         # FR-011 / FR-013 / FR-016: 文档段组装（flag 开启时执行，异常 fail-open）
         if self._summary_enabled:
@@ -606,6 +629,23 @@ class MemobaseMemoryProvider(MemoryProvider):
                 logger.warning("[memobase] summary segment build failed, fail-open: %s", exc)
                 summary_lines = []
                 used_summary = 0
+                summaries = []
+
+        # FR-019: 锚点提取（纯语义查询才启用；有时间词 → 直通路已覆盖，跳过保证幂等）
+        anchor_dates: List[str] = []
+        if self._anchor_backfill_enabled and time_window is None and summaries:
+            anchor_dates = [
+                str(s["summary_date"]).strip()
+                for s in summaries
+                if str(s.get("summary_date", "")).strip()
+            ][: self._anchor_topk]
+            # P2-3：锚点提取处加 debug 日志，区分「锚点日均已覆盖」和「代码没执行」
+            logger.debug(
+                "[memobase] anchor extraction: %d dates (anchors=%s, time_window=%s)",
+                len(anchor_dates),
+                anchor_dates,
+                time_window,
+            )
 
         # FR-014 / FR-016: 事件段预算与让渡逻辑
         if self._summary_enabled:
@@ -768,6 +808,13 @@ class MemobaseMemoryProvider(MemoryProvider):
             if len(rows) >= self._hybrid_keep:
                 break
         if not rows:
+            # P1-5：事件腿全空时锚点仍要兜底（纯语义查询 + 概要命中时恰是锚点最该介入的场景）
+            if anchor_dates and self._summary_enabled and self._anchor_backfill_enabled and self._store is not None:
+                lines, used, seen_lines = self._anchor_backfill(
+                    anchor_dates, [], fused, [], 0, seen_lines, event_budget
+                )
+                if lines:
+                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
             if summary_lines:
                 return self._finalize_hybrid(query, [], summary_lines)
             return self._call_context_vector(query)
@@ -776,6 +823,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         lines: List[str] = []
         used = 0
         for _eid, txt in rows:
+            budget_exceeded = False
             for ln in txt.splitlines():
                 ln = ln.strip()
                 if not ln:
@@ -786,10 +834,102 @@ class MemobaseMemoryProvider(MemoryProvider):
                     continue
                 seen_lines.add(disp)
                 if used + len(disp) > event_budget and lines:
-                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
+                    budget_exceeded = True
+                    break
                 lines.append(disp)
                 used += len(disp)
+            if budget_exceeded:
+                break
+
+        # FR-019: 锚点保底注入（纯语义查询且存在缺失锚点日事件时追加）
+        if anchor_dates and self._summary_enabled and self._anchor_backfill_enabled and self._store is not None:
+            lines, used, seen_lines = self._anchor_backfill(
+                anchor_dates, rows, fused, lines, used, seen_lines, event_budget
+            )
+
         return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
+
+    def _anchor_backfill(
+        self,
+        anchor_dates: List[str],
+        rows: List[Tuple[str, str]],
+        fused: List[str],
+        lines: List[str],
+        used: int,
+        seen_lines: Set[str],
+        event_budget: int,
+    ) -> Tuple[List[str], int, Set[str]]:
+        """FR-019 锚点保底注入：锚点日事件缺场时用剩余预算补 top2/日。
+
+        纯追加不改排名；任何异常回滚到调用前状态（fail-open）。
+        P1-5：抽成独立方法，rows 为空（事件腿全空）时也能兜底。
+        """
+        orig_lines = list(lines)
+        orig_used = used
+        orig_seen_lines = set(seen_lines)
+        try:
+            injected_dates = {
+                self._store.date_for(eid, tz=self._tz)
+                for eid, _ in rows
+            }
+            injected_dates.discard(None)
+            missing = [d for d in anchor_dates if d not in injected_dates]
+            if missing:
+                cand = []
+                seen_cand = {eid for eid, _ in rows}
+                rank_map = {eid: i for i, eid in enumerate(fused)}
+                for d in missing:
+                    day_evs = self._store.events_for_date(d, tz=self._tz)
+                    day_evs.sort(
+                        key=lambda e: (0, rank_map[e[0]]) if e[0] in rank_map else (1, -(self._store.time_for(e[0]) or 0.0))
+                    )
+                    added_for_day = 0
+                    for eid, _ in day_evs:
+                        if eid in seen_cand:
+                            continue
+                        seen_cand.add(eid)
+                        cand.append(eid)
+                        added_for_day += 1
+                        if added_for_day >= self._anchor_events_per_day:
+                            break
+                budget_left = min(event_budget - used, self._anchor_budget_tokens)
+                strip_chars = "-*• \t"
+                n_appended = 0
+                for eid in cand:
+                    txt = self._store.text_for(eid)
+                    if not txt:
+                        continue
+                    event_added = False
+                    for ln in txt.splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        disp = f"- {ln.lstrip(strip_chars)}"
+                        if disp in seen_lines:
+                            continue
+                        if budget_left - len(disp) < 0:
+                            break
+                        seen_lines.add(disp)
+                        lines.append(disp)
+                        budget_left -= len(disp)
+                        used += len(disp)
+                        event_added = True
+                    if event_added:
+                        n_appended += 1
+                    if budget_left <= 0:
+                        break
+                logger.info(
+                    "[memobase] anchor backfill: %d days missing, %d events appended (anchors=%s)",
+                    len(missing),
+                    n_appended,
+                    anchor_dates,
+                )
+        except Exception as exc:
+            logger.warning("[memobase] anchor backfill failed, fail-open: %s", exc)
+            lines = orig_lines
+            used = orig_used
+            seen_lines = orig_seen_lines
+        return lines, used, seen_lines
 
     _EVENT_HEADER_RE = re.compile(r"## (?:过去事件|Past Events|Events)[：:]?\s*")
 
