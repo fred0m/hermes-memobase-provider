@@ -892,7 +892,12 @@ class MemobaseMemoryProvider(MemoryProvider):
                         added_for_day += 1
                         if added_for_day >= self._anchor_events_per_day:
                             break
-                budget_left = min(event_budget - used, self._anchor_budget_tokens)
+                # FR-019 fix（2026-09-03）：锚点预算独立，不再被事件腿挤占
+                # 原逻辑 budget_left = min(event_budget - used, anchor_budget) 在事件腿
+                # 吃满预算（used≈850）时只剩个位数 token，锚点全被挡掉（79% 0 appended）。
+                # 锚点是「时间敏感查询的缺失日保底」，不该跟日常检索抢同一池子；
+                # 独立预算最多 +200 字符/次，换取缺失日事件真正可补。
+                budget_left = self._anchor_budget_tokens
                 strip_chars = "-*• \t"
                 n_appended = 0
                 for eid in cand:
@@ -1010,7 +1015,7 @@ class MemobaseMemoryProvider(MemoryProvider):
             has = self._prefetch_result is not None
         if not has:
             return None
-        return RecallStatus(provider_label="memobase", count=0, glyph="🧠")
+        return RecallStatus(provider_label="小爱正在回忆", count=0, glyph="💭")
 
     # ------------------------------------------------------------------ #
     # Turn sync (writes)
