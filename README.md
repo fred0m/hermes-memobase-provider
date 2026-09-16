@@ -2,7 +2,7 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) memory provider
 plugin that connects the `MemoryProvider` lifecycle to a **self-hosted
-[Memobase](https://github.com/memobase-ai/memobase) server**
+[Memobase](https://github.com/memodb-io/memobase) server**
 (FastAPI + PostgreSQL + pgvector). Memobase stores a user profile
 (ontology-based topics) plus an append-only event timeline, extracted offline
 by an LLM when the buffer flushes.
@@ -24,6 +24,50 @@ When the provider is active, Hermes automatically:
    threshold).
 3. Exposes **`memobase_search`** / **`memobase_profile`** tools as an
    on-demand backstop.
+
+## Hybrid retrieval (v3)
+
+Recall is not a single vector lookup. The context endpoint is queried with a
+fixed budget, and the plugin runs its own **three-leg hybrid retrieval**
+locally over the returned event window:
+
+| Leg | Signal | Purpose |
+|-----|--------|---------|
+| `bm25` | Okapi BM25 over CJK-bigram + latin tokens | exact term / keyword match |
+| `vec` | Memobase's own embeddings | semantic match |
+| `entity` | inverted index over extracted entities | proper nouns, file paths, IPs, domains, IDs, quoted strings, book titles |
+
+The three ranked lists are fused with **Reciprocal Rank Fusion (RRF)**, then
+refined by two optional passes:
+
+- **Temporal boost** — when the query contains a time expression
+  (`今天` / `昨天` / `上周` / `3天前` / …), events inside the parsed window are
+  multiplied by `temporal_gain`; events outside decay exponentially with
+  `temporal_half_life_days`, floored at `temporal_floor`.
+- **Conditional rerank (opt-in)** — a cross-encoder rerank pass fires only
+  when the fused score distribution is *low-discrimination* (i.e. the ranking
+  is too flat to trust), so a clear-cut ranking never pays the latency cost.
+  **It runs only when you configure both `rerank_base_url` and
+  `rerank_api_key`.** There is no default endpoint, so an unconfigured install
+  makes no outbound request to any host but your own Memobase server.
+
+Tunable through `$HERMES_HOME/memobase.json` — see the module docstring in
+`__init__.py` for the full list (`hybrid_enabled`, `hybrid_keep`,
+`temporal_*`, `entity_boost_enabled`, `rerank_*`, `timezone`, …).
+
+### CJK proper nouns
+
+The entity leg recognizes structured entities (paths, IPs, domains, camel
+case, quoted text) out of the box. Personal names are deployment-specific, so
+the public build ships **no** name list. Add your own:
+
+```json
+{
+  "cjk_known_names": ["Alice", "Bob"]
+}
+```
+
+Empty (the default) is fine — everything else still works.
 
 ## Requirements
 
@@ -64,7 +108,17 @@ Behavioral settings may live in `~/.hermes/memobase.json`:
   "prefetch_max_tokens": 2000,
   "prefetch_wait_secs": 5,
   "fill_window_events": true,
-  "time_range_days": 180
+  "time_range_days": 180,
+  "hybrid_enabled": true,
+  "hybrid_keep": 10,
+  "temporal_boost_enabled": true,
+  "temporal_gain": 1.6,
+  "temporal_half_life_days": 30,
+  "temporal_floor": 0.6,
+  "timezone": "Asia/Shanghai",
+  "cjk_known_names": [],
+  "rerank_base_url": "",
+  "rerank_api_key": ""
 }
 ```
 
@@ -90,6 +144,10 @@ Behavioral settings may live in `~/.hermes/memobase.json`:
   the search tool remains available.
 - **Business errors are caught**: Memobase may return HTTP 200 with a
   non-zero `errno` body; those are treated as failures, not successes.
+- **One outbound host by default**: your Memobase server. Vector recall and
+  the entity leg are computed locally from the context payload. The reranker
+  is the only other path, and it stays off until you set both an endpoint and
+  a key for it.
 
 ## Development
 
