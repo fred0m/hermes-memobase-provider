@@ -24,6 +24,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
@@ -165,9 +166,52 @@ _COMMON_UPPER_STOPWORDS = {
     "ONE", "TOP", "APP", "API", "URL", "URI", "HTTP", "POST", "JSON",
 }
 
-_CJK_KNOWN = [
-    "图图", "沫沫", "小爱", "爱音", "克拉拉", "岁岁", "潜潜", "纪纪", "灯灯",
-]
+# Built-in CJK proper-noun seeds. EMPTY by default: personal names are
+# deployment-specific, so they belong in the deployment's own config
+# (``cjk_known_names`` in memobase.json) rather than upstream. Set
+# ``_CJK_KNOWN = _load_cjk_known_names(hermes_home)`` at initialize() to
+# extend this list at runtime.
+_CJK_KNOWN = []
+
+
+def load_cjk_known_names(hermes_home: str) -> List[str]:
+    """Read optional ``cjk_known_names`` from ``$HERMES_HOME/memobase.json``.
+
+    Returns a plain list of strings; empty on any failure (missing file,
+    bad JSON, wrong type). The provider merges the result into the module
+    level ``_CJK_KNOWN`` so a deployment keeps its own proper-noun seeds
+    without them living in the public source tree.
+    """
+    try:
+        path = Path(hermes_home) / "memobase.json"
+        if not path.is_file():
+            return []
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    names = data.get("cjk_known_names")
+    if not isinstance(names, list):
+        return []
+    return [n.strip() for n in names if isinstance(n, str) and n.strip()]
+
+
+def set_cjk_known_names(names: Sequence[str]) -> List[str]:
+    """Replace the module-level ``_CJK_KNOWN`` seeds; returns the new list.
+
+    Called from the provider's ``initialize()`` so a deployment's own
+    proper nouns participate in entity extraction. Idempotent: re-running
+    with the same names leaves ``_CJK_KNOWN`` unchanged.
+    """
+    global _CJK_KNOWN
+    cleaned: List[str] = []
+    seen: Set[str] = set()
+    for name in names or []:
+        val = str(name).strip()
+        if val and val not in seen:
+            seen.add(val)
+            cleaned.append(val)
+    _CJK_KNOWN = cleaned
+    return list(_CJK_KNOWN)
 
 # 拉丁专名表：严格要求 \b 单词边界（agy P0-2：omp 子串匹配误报 prompt/company）
 _LATIN_KNOWN_RES = [

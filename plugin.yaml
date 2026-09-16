@@ -1,3 +1,19 @@
 name: memobase
-version: 1.0.0
-description: "Memobase — self-hosted user profile + event timeline memory backend, with automatic per-turn recall."
+version: 3.0.0
+description: "Memobase — self-hosted user profile + event timeline memory backend, with automatic per-turn recall and hybrid (BM25 + vector + entity) retrieval."
+
+requires_env:
+  - name: MEMOBASE_BASE_URL
+    description: Base URL of your self-hosted Memobase server, including the
+      /api/v1 suffix (e.g. http://127.0.0.1:8019/api/v1)
+  - name: MEMOBASE_API_KEY
+    description: Bearer token for that Memobase server
+    secret: true
+
+optional_env:
+  - name: MEMOBASE_USER_NAME
+    description: Maps to the Memobase user id via uuid5(NAMESPACE_DNS, name +
+      "memobase_client"); defaults to "user"
+  - name: MEMOBASE_RERANK_API_KEY
+    description: API key for the cross-encoder reranker; rerank is skipped when
+      unset (recall still works on the RRF order)

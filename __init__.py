@@ -52,6 +52,10 @@ Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
     temporal_floor             decay floor multiplier (default 0.6)
     timezone                   local timezone for date-diff computation (default "Asia/Shanghai")
     entity_boost_enabled       enable entity boost via inverted index RRF leg (default true)
+    cjk_known_names            extra CJK proper nouns that always count as entities
+                               (e.g. ["Alice", "Bob"]-style names); default [] — the
+                               public build ships no personal names, deployments add
+                               their own here
 """  # noqa: E501
 
 from __future__ import annotations
@@ -78,12 +82,14 @@ from .hybrid_retriever import (
     EventStore,
     extract_entities,
     get_timezone,
+    load_cjk_known_names,
     low_discrimination,
     parse_created_at,
     parse_time_window,
     rerank,
     rrf_fusion,
     rrf_fusion_scored,
+    set_cjk_known_names,
     temporal_factor,
 )
 
@@ -208,6 +214,10 @@ class MemobaseMemoryProvider(MemoryProvider):
             self._writes_enabled = False
 
         cfg = _load_json_config(hermes_home)
+
+        # Deployment-specific CJK proper nouns (memobase.json: cjk_known_names).
+        # Kept out of the public source tree; empty list = upstream default.
+        set_cjk_known_names(load_cjk_known_names(hermes_home))
         self._prefetch_max_tokens = int(
             cfg.get(
                 "prefetch_max_tokens",
