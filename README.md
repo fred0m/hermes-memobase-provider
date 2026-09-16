@@ -44,10 +44,12 @@ refined by two optional passes:
   (`今天` / `昨天` / `上周` / `3天前` / …), events inside the parsed window are
   multiplied by `temporal_gain`; events outside decay exponentially with
   `temporal_half_life_days`, floored at `temporal_floor`.
-- **Conditional rerank** — a cross-encoder rerank pass fires only when the
-  fused score distribution is *low-discrimination* (i.e. the ranking is too
-  flat to trust), so a clear-cut ranking never pays the latency cost.
-  **Rerank is skipped entirely when no API key is configured.**
+- **Conditional rerank (opt-in)** — a cross-encoder rerank pass fires only
+  when the fused score distribution is *low-discrimination* (i.e. the ranking
+  is too flat to trust), so a clear-cut ranking never pays the latency cost.
+  **It runs only when you configure both `rerank_base_url` and
+  `rerank_api_key`.** There is no default endpoint, so an unconfigured install
+  makes no outbound request to any host but your own Memobase server.
 
 Tunable through `$HERMES_HOME/memobase.json` — see the module docstring in
 `__init__.py` for the full list (`hybrid_enabled`, `hybrid_keep`,
@@ -114,7 +116,9 @@ Behavioral settings may live in `~/.hermes/memobase.json`:
   "temporal_half_life_days": 30,
   "temporal_floor": 0.6,
   "timezone": "Asia/Shanghai",
-  "cjk_known_names": []
+  "cjk_known_names": [],
+  "rerank_base_url": "",
+  "rerank_api_key": ""
 }
 ```
 
@@ -140,10 +144,10 @@ Behavioral settings may live in `~/.hermes/memobase.json`:
   the search tool remains available.
 - **Business errors are caught**: Memobase may return HTTP 200 with a
   non-zero `errno` body; those are treated as failures, not successes.
-- **No network calls without a key**: vector recall and the entity leg are
-  computed locally from the context payload; the only external call the
-  plugin can make beyond your Memobase server is the optional reranker, and
-  only when `MEMOBASE_RERANK_API_KEY` is set.
+- **One outbound host by default**: your Memobase server. Vector recall and
+  the entity leg are computed locally from the context payload. The reranker
+  is the only other path, and it stays off until you set both an endpoint and
+  a key for it.
 
 ## Development
 

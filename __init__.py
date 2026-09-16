@@ -56,6 +56,12 @@ Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
                                (e.g. ["Alice", "Bob"]-style names); default [] — the
                                public build ships no personal names, deployments add
                                their own here
+    rerank_enabled             allow the optional cross-encoder rerank pass (default true)
+    rerank_mode                auto | always | never (default auto)
+    rerank_base_url            OpenAI-compatible endpoint serving the reranker;
+                               NO default — rerank runs only when both this and
+                               rerank_api_key are set
+    rerank_api_key             key for that endpoint (falls back to MEMOBASE_RERANK_API_KEY)
 """  # noqa: E501
 
 from __future__ import annotations
@@ -174,7 +180,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._rerank_enabled = True
         self._rerank_mode = "auto"  # auto | always | never
         self._rerank_model = "Qwen/Qwen3-Reranker-4B"
-        self._rerank_base_url = "https://api.siliconflow.cn/v1"
+        self._rerank_base_url = ""
         self._rerank_api_key = ""
         self._rerank_topk = 15
         self._rerank_keep = 8
@@ -290,9 +296,12 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._rerank_model = str(
             cfg.get("rerank_model") or os.environ.get("MEMOBASE_RERANK_MODEL") or "Qwen/Qwen3-Reranker-4B"
         )
+        # No default endpoint: rerank stays off unless the deployment names
+        # BOTH an endpoint and a key. This plugin makes no outbound call to any
+        # host the user did not explicitly configure.
         self._rerank_base_url = str(
-            cfg.get("rerank_base_url") or os.environ.get("MEMOBASE_RERANK_BASE_URL") or "https://api.siliconflow.cn/v1"
-        )
+            cfg.get("rerank_base_url") or os.environ.get("MEMOBASE_RERANK_BASE_URL") or ""
+        ).strip()
         self._rerank_api_key = str(
             cfg.get("rerank_api_key") or os.environ.get("MEMOBASE_RERANK_API_KEY") or ""
         ).strip()
@@ -523,7 +532,7 @@ class MemobaseMemoryProvider(MemoryProvider):
 
         # --- rerank gating: only pay when the coarse ranking is suspect ---
         use_rerank = False
-        if self._rerank_enabled and self._rerank_api_key:
+        if self._rerank_enabled and self._rerank_api_key and self._rerank_base_url:
             if self._rerank_mode == "always":
                 use_rerank = True
             elif self._rerank_mode == "auto":

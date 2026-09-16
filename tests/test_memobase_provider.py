@@ -391,3 +391,66 @@ class TestCjkKnownNamesConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRerankIsOptIn(unittest.TestCase):
+    """Rerank must not fire unless BOTH an endpoint and a key are configured.
+
+    The plugin ships no default rerank endpoint, so an unconfigured install
+    cannot reach a third-party host.
+    """
+
+    def _provider(self, **cfg_overrides):
+        """Provider whose initialize() config comes from a temp HERMES_HOME."""
+        with tempfile.TemporaryDirectory() as home:
+            if cfg_overrides:
+                with open(os.path.join(home, "memobase.json"), "w", encoding="utf-8") as fh:
+                    json.dump(cfg_overrides, fh)
+            p, transport = _make_provider()
+            with mock.patch.dict(os.environ, {"MEMOBASE_BASE_URL": BASE_URL}, clear=False):
+                os.environ.pop("MEMOBASE_RERANK_API_KEY", None)
+                os.environ.pop("MEMOBASE_RERANK_BASE_URL", None)
+                p.initialize(session_id="s", hermes_home=home, agent_context="primary")
+            return p, transport
+
+    def test_no_default_endpoint(self):
+        """A fresh instance has no rerank endpoint baked in."""
+        p = MemobaseMemoryProvider()
+        self.assertEqual(p._rerank_base_url, "")
+        self.assertEqual(p._rerank_api_key, "")
+
+    def test_key_without_endpoint_does_not_trigger(self):
+        """A key alone is not enough — without an endpoint, rerank stays off."""
+        p, _ = self._provider(rerank_api_key="sk-test", rerank_base_url="")
+        self.assertFalse(p._rerank_enabled and p._rerank_api_key and p._rerank_base_url)
+
+    def test_endpoint_without_key_does_not_trigger(self):
+        """An endpoint alone is not enough either."""
+        p, _ = self._provider(rerank_base_url="https://rerank.example/v1", rerank_api_key="")
+        self.assertFalse(p._rerank_enabled and p._rerank_api_key and p._rerank_base_url)
+
+    def test_both_configured_enables(self):
+        """Explicitly configuring both is what turns rerank on."""
+        p, _ = self._provider(
+            rerank_base_url="https://rerank.example/v1", rerank_api_key="sk-test"
+        )
+        self.assertEqual(p._rerank_base_url, "https://rerank.example/v1")
+        self.assertTrue(p._rerank_enabled and p._rerank_api_key and p._rerank_base_url)
+
+    def test_env_var_still_works(self):
+        """MEMOBASE_RERANK_* remains a supported way to opt in."""
+        with tempfile.TemporaryDirectory() as home:
+            p, _ = _make_provider()
+            env = {
+                "MEMOBASE_BASE_URL": BASE_URL,
+                "MEMOBASE_RERANK_BASE_URL": "https://rerank.example/v1",
+                "MEMOBASE_RERANK_API_KEY": "sk-env",
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                p.initialize(session_id="s", hermes_home=home, agent_context="primary")
+            self.assertEqual(p._rerank_base_url, "https://rerank.example/v1")
+            self.assertEqual(p._rerank_api_key, "sk-env")
+
+
+if __name__ == "__main__":
+    unittest.main()
