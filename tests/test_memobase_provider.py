@@ -336,15 +336,25 @@ class TestCjkKnownNamesConfig(unittest.TestCase):
     def tearDown(self):
         self.hr.set_cjk_known_names(self._saved)
 
-    def test_public_default_is_empty(self):
-        """The public build ships an empty seed list — no personal names."""
-        import re
-        with open(os.path.join(REPO_ROOT, "hybrid_retriever.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        m = re.search(r"^_CJK_KNOWN\s*=\s*(\[.*?\])", src, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(m, "_CJK_KNOWN assignment not found")
-        self.assertEqual(m.group(1).replace(" ", ""), "[]",
-                         "public build must ship an empty _CJK_KNOWN")
+    def test_public_default_ships_no_names(self):
+        """A fresh import has an empty seed list: names arrive via config only.
+
+        Guards the packaging contract that the public build carries no
+        deployment-specific proper nouns.
+        """
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_file_location(
+            "_fresh_memobase_plugin",
+            os.path.join(REPO_ROOT, "__init__.py"),
+            submodule_search_locations=[REPO_ROOT],
+        )
+        fresh = _ilu.module_from_spec(spec)
+        sys.modules[spec.name] = fresh
+        try:
+            spec.loader.exec_module(fresh)
+        finally:
+            sys.modules.pop(spec.name, None)
+        self.assertEqual(fresh.hybrid_retriever._CJK_KNOWN, [])
 
     def test_loader_reads_config(self):
         with tempfile.TemporaryDirectory() as home:
