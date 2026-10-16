@@ -175,6 +175,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._prefetch_for_query: Optional[str] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._writes_enabled = True
+        self._send_assistant = True
         self._fail_count = 0
         self._breaker_open_until = 0.0
         self._prefetch_max_tokens = _DEFAULT_PREFETCH_MAX_TOKENS
@@ -394,6 +395,15 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._api_key = os.environ.get("MEMOBASE_API_KEY") or None
         user_name = os.environ.get("MEMOBASE_USER_NAME", _DEFAULT_USER_NAME)
         self._user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, user_name + "memobase_client"))
+        # Role attribution: the assistant's turns are context for understanding the
+        # conversation, not statements about the user. Sending them to profile
+        # extraction causes assistant-authored text (task briefs, plans, "you are X")
+        # to be stored as the user's own facts.
+        # Default True preserves upstream behaviour; set MEMOBASE_SEND_ASSISTANT=false
+        # to send only the user's own turns.
+        self._send_assistant = _as_bool(
+            os.environ.get("MEMOBASE_SEND_ASSISTANT"), default=True
+        )
 
         headers = {}
         if self._api_key:
@@ -1078,15 +1088,17 @@ class MemobaseMemoryProvider(MemoryProvider):
 
         def _sync() -> None:
             try:
-                body = {
-                    "blob_type": "chat",
-                    "blob_data": {
-                        "messages": [
-                            {"role": "user", "content": user_content[:_MAX_QUERY_CHARS * 2]},
-                            {"role": "assistant", "content": assistant_content[:_MAX_QUERY_CHARS * 2]},
-                        ]
-                    },
-                }
+                messages = [
+                    {"role": "user", "content": user_content[:_MAX_QUERY_CHARS * 2]},
+                ]
+                if self._send_assistant:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": assistant_content[:_MAX_QUERY_CHARS * 2],
+                        }
+                    )
+                body = {"blob_type": "chat", "blob_data": {"messages": messages}}
                 r = self._client.post(
                     f"/blobs/insert/{self._user_id}?wait_process=false",
                     json=body,
