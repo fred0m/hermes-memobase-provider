@@ -418,8 +418,9 @@ class MemobaseMemoryProvider(MemoryProvider):
                 self._client, self._user_id, ttl_secs=self._event_cache_ttl
             )
         logger.info(
-            "[memobase] initialized base=%s user=%s writes=%s",
+            "[memobase] initialized base=%s user=%s writes=%s send_assistant=%s",
             self._base_url, self._user_id, self._writes_enabled,
+            getattr(self, "_send_assistant", True),
         )
 
     def shutdown(self) -> None:
