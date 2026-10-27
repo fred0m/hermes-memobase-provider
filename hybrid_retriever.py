@@ -554,12 +554,16 @@ class EventStore:
         client,
         user_id: str,
         ttl_secs: float = 300.0,
-        max_events: int = 1000,
+        max_events: int = 2000,
+        time_range_days: int = 3650,
     ) -> None:
         self._client = client
         self._user_id = user_id
         self._ttl = ttl_secs
         self._max_events = max_events
+        # 服务端列表接口的 default 只有 21 天，这里显式放宽到 10 年，
+        # 与向量腿 /users/event/search 的 time_range_in_days=3650 保持一致。
+        self._time_range_days = time_range_days
         self._lock = threading.Lock()
         self._texts: Dict[str, str] = {}
         self._times: Dict[str, float] = {}
@@ -575,7 +579,13 @@ class EventStore:
         """Run the full HTTP fetch + index build WITHOUT holding the lock."""
         r = self._client.get(
             f"/users/event/{self._user_id}",
-            params={"topk": str(self._max_events), "need_summary": "false"},
+            params={
+                "topk": str(self._max_events),
+                "need_summary": "false",
+                # 服务端默认只返回最近 21 天（controllers/event.py 的默认值），
+                # 不传这个参数的话 BM25 语料池只有一个 21 天窗口 → 老事件关键词召回 0。
+                "time_range_in_days": str(self._time_range_days),
+            },
         )
         r.raise_for_status()
         data = r.json()
