@@ -426,7 +426,11 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._client = httpx.Client(
             base_url=self._base_url,
             headers=headers,
-            timeout=8.0,
+            # 8s 太紧：memobase 重启后首次检索要先算 query embedding，
+            # 硅基流动冷启动实测有过 12~25s 的抽风（Qwen3-Embedding-8B 时代记录，4B 偶发），
+            # 撞上就整条 hybrid 腿 fallback 成纯向量（2026-10-27 13:40 实测一次）。
+            # hot-path 等待由 _prefetch_wait_secs(5s) 独立控制，调大这里不会让用户等更久。
+            timeout=15.0,
         )
         if self._hybrid_enabled:
             self._store = EventStore(
