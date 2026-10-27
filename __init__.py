@@ -253,6 +253,15 @@ class MemobaseMemoryProvider(MemoryProvider):
             # subagent / cron / flush system prompts would corrupt the
             # user profile — keep recalling, stop writing.
             self._writes_enabled = False
+        # 别的 agent（如 AstrBot 经 A2A）说的话不是「用户说的话」，写进画像/事件流
+        # 会让后续回忆分不清是谁说的。只关写入，召回照旧（回答 peer 时还需要上下文）。
+        # platform 可能是 Platform 枚举而非裸字符串（枚举 str() = "Platform.A2A"），兜一层。
+        _plat = kwargs.get("platform")
+        _plat_key = str(
+            getattr(_plat, "value", None) or getattr(_plat, "name", None) or _plat or ""
+        ).strip().lower()
+        if _plat_key in {"a2a"}:
+            self._writes_enabled = False
 
         cfg = _load_json_config(hermes_home)
 
@@ -312,6 +321,22 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._summary_single_day_budget = _cfg_int(
             cfg.get("summary_single_day_budget", os.environ.get("MEMOBASE_SUMMARY_SINGLE_DAY_BUDGET", 700)), 700
         )
+        # 静态 head 注入策略（图图 2026-10-27 评估 D）：
+        #   always   = 现状，每轮都带画像/记忆块
+        #   periodic = 每 K 轮带一次，其余轮只带概要 + 事件
+        # 省的是「每轮重放」的静态重复 token（热会话实测占 memory-context 约 49%）。
+        # K 越小越安全：压缩保留的尾部窗口 protect_last_n=6 ≈ 最近 3 轮，K≤3 时画像永不断。
+        self._head_inject_policy = str(
+            cfg.get("head_inject_policy", os.environ.get("MEMOBASE_HEAD_INJECT_POLICY", "always")) or "always"
+        ).strip().lower()
+        if self._head_inject_policy not in ("always", "periodic"):
+            self._head_inject_policy = "always"
+        self._head_periodic_k = max(
+            1,
+            _cfg_int(cfg.get("head_inject_periodic_k", os.environ.get("MEMOBASE_HEAD_PERIODIC_K", 5)), 5),
+        )
+        # per-session 轮次计数（periodic 用）；重启后归零 = 首轮必带 head，安全侧偏差
+        self._head_counters: Dict[str, int] = {}
         # Anchor backfill config (FR-019)
         self._anchor_backfill_enabled = _as_bool(
             cfg.get("anchor_backfill_enabled", os.environ.get("MEMOBASE_ANCHOR_ENABLED", True)), True
@@ -518,7 +543,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._record_success()
         return ctx.strip()
 
-    def _call_context(self, query: str) -> str:
+    def _call_context(self, query: str, session_id: str = "") -> str:
         """Hybrid recall (BM25 + vector RRF) with automatic vector fallback.
 
         The vector path (context API) is still the source of truth for the
@@ -528,7 +553,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         if not self._hybrid_enabled or self._store is None:
             return self._call_context_vector(query)
         try:
-            return self._call_context_hybrid(query)
+            return self._call_context_hybrid(query, session_id=session_id)
         except Exception as exc:
             logger.warning("[memobase] hybrid recall failed, fallback to vector: %s", exc)
             return self._call_context_vector(query)
@@ -610,7 +635,7 @@ class MemobaseMemoryProvider(MemoryProvider):
 
         return merged[: self._summary_topk]
 
-    def _call_context_hybrid(self, query: str) -> str:
+    def _call_context_hybrid(self, query: str, session_id: str = "") -> str:
         """Run BM25 + vector legs, fuse with RRF, rebuild the event section.
 
         Both legs operate on the SAME id space (event id): the vector leg is
@@ -874,9 +899,9 @@ class MemobaseMemoryProvider(MemoryProvider):
                     anchor_dates, [], fused, [], 0, seen_lines, event_budget
                 )
                 if lines:
-                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
+                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None, session_id=session_id)
             if summary_lines:
-                return self._finalize_hybrid(query, [], summary_lines)
+                return self._finalize_hybrid(query, [], summary_lines, session_id=session_id)
             return self._call_context_vector(query)
 
         # --- rebuild event section under the token budget (line-level dedupe) ---
@@ -907,7 +932,7 @@ class MemobaseMemoryProvider(MemoryProvider):
                 anchor_dates, rows, fused, lines, used, seen_lines, event_budget
             )
 
-        return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None)
+        return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None, session_id=session_id)
 
     def _anchor_backfill(
         self,
@@ -998,11 +1023,31 @@ class MemobaseMemoryProvider(MemoryProvider):
 
     _EVENT_HEADER_RE = re.compile(r"## (?:过去事件|Past Events|Events)[：:]?\s*")
 
+    def _should_inject_head(self, session_id: str) -> bool:
+        """This turn's memory-context 是否带静态 head（画像 / 记忆块）。
+
+        Hermes 把拼好的 block 写进 user 行的 api_content 并「每轮原样重放」，
+        所以常开的 head 是每轮都在付费的固定开销。``periodic`` 下每 K 轮才带一次，
+        概要层与事件层完全不受影响；画像在压缩中被挤掉后最多 K 轮自愈，
+        ``memobase_search`` 工具任何时候都能拿到完整画像兜底。
+        """
+        if self._head_inject_policy != "periodic":
+            return True
+        if not session_id:
+            # 没有会话上下文（memobase_search 工具调用等）→ 永远带完整 head：
+            # 工具是「拉得到画像」的最后兜底，不能跟着周期策略一起省。
+            return True
+        with self._lock:
+            tick = self._head_counters.get(session_id, 0)
+            self._head_counters[session_id] = tick + 1
+        return tick % self._head_periodic_k == 0
+
     def _finalize_hybrid(
         self,
         query: str,
         lines: List[str],
         summary_lines: Optional[List[str]] = None,
+        session_id: str = "",
     ) -> str:
         """Attach the mixed event section to the vector context's profile part."""
         logger.info(
@@ -1013,6 +1058,8 @@ class MemobaseMemoryProvider(MemoryProvider):
         )
         base = self._call_context_vector(query, _with_events=False)
         head = self._EVENT_HEADER_RE.split(base, maxsplit=1)[0]
+        if not self._should_inject_head(session_id):
+            head = ""
         summary_part = ""
         if summary_lines:
             summary_part = "## 近期概要：\n" + "\n".join(summary_lines) + "\n\n"
@@ -1057,7 +1104,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         def _run() -> None:
             t0 = time.time()
             try:
-                ctx = self._call_context(query)
+                ctx = self._call_context(query, session_id=session_id)
                 ctx = ctx or ""
                 dur = time.time() - t0
                 # 观测用（图图 2026-10-27 评估建议）：每轮一行，正常也打（info 级）——
