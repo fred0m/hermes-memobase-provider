@@ -199,6 +199,10 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._anchor_events_per_day = 2
         self._anchor_budget_tokens = 200
         self._event_cache_ttl = 300.0
+        # BM25 语料池：服务端列表接口默认只给最近 21 天，且 topk 有硬上限。
+        # 上限撞线后最老事件会静默掉出 BM25 腿与实体腿（两腿同源）→ 关键词召回对老事件无声失效。
+        self._bm25_max_events = 2000
+        self._bm25_time_range_days = 3650
         self._temporal_boost_enabled = True
         self._temporal_gain = 1.6
         self._temporal_half_life_days = 30.0
@@ -322,6 +326,17 @@ class MemobaseMemoryProvider(MemoryProvider):
             cfg.get("anchor_budget_tokens", os.environ.get("MEMOBASE_ANCHOR_BUDGET_TOKENS", 200)), 200
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
+        # events 接近上限时调这两个（events > 1500 就该调；改后重启 Hermes 生效）
+        self._bm25_max_events = _cfg_int(
+            cfg.get("bm25_max_events", os.environ.get("MEMOBASE_BM25_MAX_EVENTS", 2000)), 2000
+        )
+        self._bm25_time_range_days = _cfg_int(
+            cfg.get(
+                "bm25_time_range_days",
+                os.environ.get("MEMOBASE_BM25_TIME_RANGE_DAYS", 3650),
+            ),
+            3650,
+        )
 
         # Temporal boost config (P0-A)
         self._temporal_boost_enabled = _as_bool(
@@ -415,7 +430,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         )
         if self._hybrid_enabled:
             self._store = EventStore(
-                self._client, self._user_id, ttl_secs=self._event_cache_ttl
+                self._client, self._user_id, ttl_secs=self._event_cache_ttl,
+                max_events=self._bm25_max_events,
+                time_range_days=self._bm25_time_range_days,
             )
         logger.info(
             "[memobase] initialized base=%s user=%s writes=%s send_assistant=%s",
@@ -1174,7 +1191,9 @@ class MemobaseMemoryProvider(MemoryProvider):
                 try:
                     target_date = datetime.strptime(str(date_arg).strip(), "%Y-%m-%d").date()
                     if self._store is None and self._client is not None and self._user_id is not None:
-                        self._store = EventStore(self._client, self._user_id, ttl_secs=self._event_cache_ttl)
+                        self._store = EventStore(self._client, self._user_id, ttl_secs=self._event_cache_ttl,
+                                                 max_events=self._bm25_max_events,
+                                                 time_range_days=self._bm25_time_range_days)
 
                     if self._store is not None:
                         self._store.refresh()
