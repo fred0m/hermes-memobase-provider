@@ -1060,18 +1060,18 @@ class MemobaseMemoryProvider(MemoryProvider):
                 ctx = self._call_context(query)
                 ctx = ctx or ""
                 dur = time.time() - t0
-                # 观测用（图图 2026-10-27 评估建议）：不刷屏，只在「空召回 / 慢」时出声 ——
-                # 这是「漏召回、旧事件挤占」这类质量事件唯一的线索来源（此前一条延迟日志都没有）
+                # 观测用（图图 2026-10-27 评估建议）：每轮一行，正常也打（info 级）——
+                # debug 级在 agent.log 里看不到，等于没观测；空召回/慢查询额外带标记。
                 store_docs = 0
                 try:
                     if self._store is not None:
                         store_docs = len(getattr(self._store, "_texts", {}) or {})
                 except Exception:                     # noqa: BLE001
                     pass
-                emit = logger.info if (not ctx or dur > 3.0) else logger.debug
-                emit("[memobase] prefetch len=%d chars=%d dur=%.2fs bm25_docs=%d%s",
-                     len(query or ""), len(ctx), dur, store_docs,
-                     " EMPTY(疑似漏召回)" if not ctx else "")
+                logger.info("[memobase] prefetch len=%d chars=%d dur=%.2fs bm25_docs=%d%s",
+                            len(query or ""), len(ctx), dur, store_docs,
+                            " EMPTY(疑似漏召回)" if not ctx
+                            else (" SLOW" if dur > 3.0 else ""))
                 with self._lock:
                     if self._prefetch_for_query == query:
                         self._prefetch_result = ctx
