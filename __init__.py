@@ -88,6 +88,7 @@ import httpx
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 
+from .turn_filters import is_ack_only_turn
 from .hybrid_retriever import (
     _CJK_RE,
     _LATIN_RE,
@@ -443,6 +444,10 @@ class MemobaseMemoryProvider(MemoryProvider):
         # to send only the user's own turns.
         self._send_assistant = _as_bool(
             os.environ.get("MEMOBASE_SEND_ASSISTANT"), default=True
+        )
+        # 纯确认词轮次跳过入库（默认开；设 false 可恢复「原样记录每一轮」）
+        self._skip_ack_turns = _as_bool(
+            os.environ.get("MEMOBASE_SKIP_ACK_TURNS"), default=True
         )
 
         headers = {}
@@ -1168,6 +1173,13 @@ class MemobaseMemoryProvider(MemoryProvider):
         if not user_content or not assistant_content:
             return
         if self._client is None or self._user_id is None:
+            return
+        # 纯确认词轮次（「好」「继续」「嗯嗯」）不入库：服务端没有信息量门槛，
+        # 这类轮次成批 flush 会产出「用户表达了同意和确认的态度」这类空转事件
+        # 并进画像（2026-11-04 人造样本实测）。带决策的短句（「好，那就这么办吧」）
+        # 不在此列 —— 判据见 turn_filters.is_ack_only_turn。
+        if getattr(self, "_skip_ack_turns", True) and is_ack_only_turn(user_content):
+            logger.info("[memobase] skip ack-only turn: %r", user_content[:20])
             return
 
         def _sync() -> None:
