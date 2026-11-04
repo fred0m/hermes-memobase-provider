@@ -108,22 +108,51 @@ _DYNAMIC_TEMPORAL_PATTERNS: List[Tuple[re.Pattern, Callable[[int], Tuple[int, in
 ]
 
 
+_LAST_LAST_MONTH = re.compile(r"上上(?:个)?月")
+# 「最近 N 天/周/月」与「过去 N」同义；必须先消费，否则被静态「最近」(0,6) 抢先
+_RECENT_N = re.compile(r"最近\s*(\d+|[一二两三四五六七八九十]+)\s*(?:个)?(天|周|星期|月)")
+
+
 def parse_time_window(query: str) -> Optional[Tuple[int, int]]:
     """Extract temporal window (min_age_days, max_age_days) from query.
 
     Returns (min_age, max_age) left-closed right-closed integer days.
     Multiple matches pick the closest / most specific window.
     No match returns None.
+
+    两处预消费（2026-11-03 线上误识别修复，见 tests/test_time_window.py）：
+      ① 「上上个月」先于「上个月」吃掉，否则子串匹配得到 (30,59)
+      ② 「最近 N 天/周/月」先于静态「最近」(0,6) 吃掉
+    月按 30 天近似，与既有词表口径一致（不做真实月历换算）。
     """
     if not query:
         return None
     candidates: List[Tuple[int, int]] = []
+    rest = query
+
+    if _LAST_LAST_MONTH.search(rest):
+        candidates.append((60, 89))
+        rest = _LAST_LAST_MONTH.sub(" ", rest)
+
+    for m in _RECENT_N.finditer(rest):
+        n = _parse_num(m.group(1))
+        if n is None or n <= 0:
+            continue
+        unit = m.group(2)
+        if unit == "天":
+            candidates.append((0, max(0, n - 1)))
+        elif unit in ("周", "星期"):
+            candidates.append((0, max(0, n * 7 - 1)))
+        else:
+            candidates.append((0, max(0, n * 30 - 1)))
+    rest = _RECENT_N.sub(" ", rest)
+
     for pat, min_d, max_d in _STATIC_TEMPORAL_PATTERNS:
-        if pat.search(query):
+        if pat.search(rest):
             candidates.append((min_d, max_d))
 
     for pat, fn in _DYNAMIC_TEMPORAL_PATTERNS:
-        for m in pat.finditer(query):
+        for m in pat.finditer(rest):
             raw_num = m.group(1)
             n = _parse_num(raw_num)
             if n is not None and n > 0:
