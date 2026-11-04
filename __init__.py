@@ -469,9 +469,11 @@ class MemobaseMemoryProvider(MemoryProvider):
                 time_range_days=self._bm25_time_range_days,
             )
         logger.info(
-            "[memobase] initialized base=%s user=%s writes=%s send_assistant=%s",
+            "[memobase] initialized base=%s user=%s writes=%s send_assistant=%s skip_ack=%s",
             self._base_url, self._user_id, self._writes_enabled,
             getattr(self, "_send_assistant", True),
+            # 打进日志才能在重启后确认「新代码真的上位」（改配置类变更的验收靠数据，不靠进程状态）
+            getattr(self, "_skip_ack_turns", True),
         )
 
     def shutdown(self) -> None:
