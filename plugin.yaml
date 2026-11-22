@@ -1,5 +1,5 @@
 name: memobase
-version: 3.0.0
+version: 3.1.0
 description: "Memobase — self-hosted user profile + event timeline memory backend, with automatic per-turn recall and hybrid (BM25 + vector + entity) retrieval."
 
 requires_env:
