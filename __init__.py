@@ -1077,6 +1077,99 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._record_success()
         return new_ctx.strip()
 
+    # ------------------------------------------------------------------ #
+    # Extra profile sources — read-time union of OTHER memobase users.
+    #
+    # Why: an external chat client (e.g. Open WebUI) writes to its own memobase
+    # user, so ITS EVENTS never leak into this session's timeline (event
+    # isolation is a hard requirement — otherwise the agent recalls them as its
+    # own experience). But the PROFILE layer is shared: we read the other
+    # user's profile and inject it with an explicit source label, so the agent
+    # knows "she is into X *over there*" without pretending it happened here.
+    #
+    # Config ($HERMES_HOME/memobase.json):
+    #   "extra_profile_sources": [
+    #     {"name": "momo-owui", "label": "Open WebUI 侧", "max_items": 8, "max_chars": 600}
+    #   ]
+    # ------------------------------------------------------------------ #
+    _EXTRA_PROFILE_TTL = 300.0
+
+    def _extra_profile_specs(self) -> List[Dict[str, Any]]:
+        cached = getattr(self, "_extra_specs", None)
+        if cached is not None:
+            return cached
+        specs: List[Dict[str, Any]] = []
+        try:
+            home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            raw = _load_json_config(home).get("extra_profile_sources") or []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                specs.append(
+                    {
+                        "name": name,
+                        "label": str(item.get("label") or name).strip(),
+                        "max_items": _cfg_int(item.get("max_items"), 8) or 8,
+                        "max_chars": _cfg_int(item.get("max_chars"), 600) or 600,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[memobase] extra_profile_sources unreadable: %s", exc)
+        self._extra_specs = specs
+        return specs
+
+    def _extra_profile_block(self) -> str:
+        """Render other users' profiles as a labelled, read-only block."""
+        specs = self._extra_profile_specs()
+        if not specs or self._client is None:
+            return ""
+        now = time.time()
+        cached = getattr(self, "_extra_block_cache", None)
+        if cached and now - cached[0] < self._EXTRA_PROFILE_TTL:
+            return cached[1]
+        parts: List[str] = []
+        for spec in specs:
+            try:
+                uid = str(uuid.uuid5(uuid.NAMESPACE_DNS, spec["name"] + "memobase_client"))
+                r = self._client.get(f"/users/profile/{uid}")
+                r.raise_for_status()
+                data = r.json() or {}
+                if data.get("errno"):
+                    logger.warning("[memobase] extra profile %s errno=%s", spec["name"], data.get("errno"))
+                    continue
+                entries = ((data.get("data") or {}).get("profiles") or [])
+                entries.sort(
+                    key=lambda e: str(e.get("updated_at") or e.get("created_at") or ""),
+                    reverse=True,
+                )
+                lines: List[str] = []
+                budget = spec["max_chars"]
+                for e in entries[: spec["max_items"]]:
+                    text = str(e.get("content") or "").strip()
+                    if not text:
+                        continue
+                    attr = e.get("attributes") or {}
+                    tag = "/".join(x for x in (attr.get("topic"), attr.get("sub_topic")) if x)
+                    line = f"- {text}" + (f"（{tag}）" if tag else "")
+                    if len(line) > budget:
+                        break
+                    budget -= len(line)
+                    lines.append(line)
+                if lines:
+                    parts.append(
+                        f"[{spec['label']}画像 · 只读参考，不是本会话/本端经历，别当成自己做过的事]\n"
+                        + "\n".join(lines)
+                    )
+                logger.info("[memobase] extra profile injected label=%s items=%d", spec["label"], len(lines))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[memobase] extra profile %s failed: %s", spec["name"], exc)
+        block = "\n\n".join(parts)
+        self._extra_block_cache = (now, block)
+        return block
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall memories for the CURRENT question with a short hot-path wait."""
         if self._breaker_open():
@@ -1113,6 +1206,12 @@ class MemobaseMemoryProvider(MemoryProvider):
             try:
                 ctx = self._call_context(query, session_id=session_id)
                 ctx = ctx or ""
+                try:
+                    extra = self._extra_profile_block()
+                except Exception:  # noqa: BLE001 — extra sources must never break recall
+                    extra = ""
+                if extra:
+                    ctx = (ctx + "\n\n" + extra).strip() if ctx else extra
                 dur = time.time() - t0
                 # 观测用（图图 2026-10-27 评估建议）：每轮一行，正常也打（info 级）——
                 # debug 级在 agent.log 里看不到，等于没观测；空召回/慢查询额外带标记。
