@@ -52,6 +52,10 @@ Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
     temporal_floor             decay floor multiplier (default 0.6)
     timezone                   local timezone for date-diff computation (default "Asia/Shanghai")
     entity_boost_enabled       enable entity boost via inverted index RRF leg (default true)
+    anchor_backfill_enabled    enable anchor backfill injection on pure semantic queries (default true)
+    anchor_topk                number of anchor dates to extract from semantic summaries (default 2)
+    anchor_events_per_day      max events to inject per missing anchor date (default 2)
+    anchor_budget_tokens       max budget cap for anchor backfill lines (default 200)
     cjk_known_names            extra CJK proper nouns that always count as entities
                                (e.g. ["Alice", "Bob"]-style names); default [] — the
                                public build ships no personal names, deployments add
@@ -62,6 +66,8 @@ Behavioral settings (optional, ``$HERMES_HOME/memobase.json``):
                                NO default — rerank runs only when both this and
                                rerank_api_key are set
     rerank_api_key             key for that endpoint (falls back to MEMOBASE_RERANK_API_KEY)
+    recall_label               text shown by the recall indicator (default "memobase")
+    recall_glyph               emoji shown by the recall indicator (default "🧠")
 """  # noqa: E501
 
 from __future__ import annotations
@@ -74,17 +80,19 @@ import threading
 import time
 import urllib.parse
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import httpx
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 
+from .turn_filters import is_ack_only_turn
 from .hybrid_retriever import (
     _CJK_RE,
     _LATIN_RE,
+    BM25Index,
     EventStore,
     extract_entities,
     get_timezone,
@@ -145,6 +153,16 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _cfg_int(value: Any, default: int = 0) -> int:
+    """Safe int parsing — None/empty string fallback to default."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class MemobaseMemoryProvider(MemoryProvider):
     """MemoryProvider implementation backed by a self-hosted Memobase server."""
 
@@ -158,6 +176,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._prefetch_for_query: Optional[str] = None
         self._prefetch_thread: Optional[threading.Thread] = None
         self._writes_enabled = True
+        self._send_assistant = True
         self._fail_count = 0
         self._breaker_open_until = 0.0
         self._prefetch_max_tokens = _DEFAULT_PREFETCH_MAX_TOKENS
@@ -169,7 +188,22 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._hybrid_bm25_topk = 20
         self._hybrid_keep = 10
         self._hybrid_event_budget_tokens = 900
+        # Summary layer config (FR-010)
+        self._summary_enabled = False
+        self._summary_budget_tokens = 350
+        self._event_budget_tokens = 850
+        self._summary_topk = 2
+        self._summary_semantic_topk = 3
+        # Anchor backfill config (FR-019)
+        self._anchor_backfill_enabled = True
+        self._anchor_topk = 2
+        self._anchor_events_per_day = 2
+        self._anchor_budget_tokens = 200
         self._event_cache_ttl = 300.0
+        # BM25 语料池：服务端列表接口默认只给最近 21 天，且 topk 有硬上限。
+        # 上限撞线后最老事件会静默掉出 BM25 腿与实体腿（两腿同源）→ 关键词召回对老事件无声失效。
+        self._bm25_max_events = 2000
+        self._bm25_time_range_days = 3650
         self._temporal_boost_enabled = True
         self._temporal_gain = 1.6
         self._temporal_half_life_days = 30.0
@@ -187,6 +221,8 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._rerank_ratio_threshold = 1.01
         self._rerank_overlap_threshold = 0.3
         self._rerank_sim_threshold = 0.3
+        self._recall_label = "memobase"
+        self._recall_glyph = "🧠"
         self._store: Optional[EventStore] = None
         self._sync_lock = threading.Lock()
         self._sync_thread: Optional[threading.Thread] = None
@@ -218,12 +254,26 @@ class MemobaseMemoryProvider(MemoryProvider):
             # subagent / cron / flush system prompts would corrupt the
             # user profile — keep recalling, stop writing.
             self._writes_enabled = False
+        # 别的 agent（如 AstrBot 经 A2A）说的话不是「用户说的话」，写进画像/事件流
+        # 会让后续回忆分不清是谁说的。只关写入，召回照旧（回答 peer 时还需要上下文）。
+        # platform 可能是 Platform 枚举而非裸字符串（枚举 str() = "Platform.A2A"），兜一层。
+        _plat = kwargs.get("platform")
+        _plat_key = str(
+            getattr(_plat, "value", None) or getattr(_plat, "name", None) or _plat or ""
+        ).strip().lower()
+        if _plat_key in {"a2a"}:
+            self._writes_enabled = False
 
         cfg = _load_json_config(hermes_home)
 
         # Deployment-specific CJK proper nouns (memobase.json: cjk_known_names).
         # Kept out of the public source tree; empty list = upstream default.
         set_cjk_known_names(load_cjk_known_names(hermes_home))
+
+        # Recall indicator label. The public default is the provider name;
+        # a deployment can brand it (memobase.json: recall_label / recall_glyph).
+        self._recall_label = str(cfg.get("recall_label") or "").strip() or "memobase"
+        self._recall_glyph = str(cfg.get("recall_glyph") or "").strip() or "🧠"
         self._prefetch_max_tokens = int(
             cfg.get(
                 "prefetch_max_tokens",
@@ -245,10 +295,74 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._hybrid_keep = int(
             cfg.get("hybrid_keep", os.environ.get("MEMOBASE_HYBRID_KEEP", 10))
         )
-        self._hybrid_event_budget_tokens = int(
-            cfg.get("hybrid_event_budget_tokens", os.environ.get("MEMOBASE_HYBRID_EVENT_BUDGET", 900))
+        # Summary layer configs (FR-010 / FR-014)
+        self._summary_enabled = _as_bool(
+            cfg.get("summary_enabled", os.environ.get("MEMOBASE_SUMMARY_ENABLED", False)), False
+        )
+        self._summary_budget_tokens = _cfg_int(
+            cfg.get("summary_budget_tokens", os.environ.get("MEMOBASE_SUMMARY_BUDGET_TOKENS", 350)), 350
+        )
+        self._event_budget_tokens = _cfg_int(
+            cfg.get(
+                "event_budget_tokens",
+                os.environ.get(
+                    "MEMOBASE_EVENT_BUDGET_TOKENS",
+                    cfg.get("hybrid_event_budget_tokens", os.environ.get("MEMOBASE_HYBRID_EVENT_BUDGET", 850)),
+                ),
+            ),
+            850,
+        )
+        self._hybrid_event_budget_tokens = self._event_budget_tokens
+        self._summary_topk = _cfg_int(
+            cfg.get("summary_topk", os.environ.get("MEMOBASE_SUMMARY_TOPK", 2)), 2
+        )
+        self._summary_semantic_topk = _cfg_int(
+            cfg.get("summary_semantic_topk", os.environ.get("MEMOBASE_SUMMARY_SEMANTIC_TOPK", 3)), 3
+        )
+        self._summary_single_day_budget = _cfg_int(
+            cfg.get("summary_single_day_budget", os.environ.get("MEMOBASE_SUMMARY_SINGLE_DAY_BUDGET", 700)), 700
+        )
+        # 静态 head 注入策略（图图 2026-10-27 评估 D）：
+        #   always   = 现状，每轮都带画像/记忆块
+        #   periodic = 每 K 轮带一次，其余轮只带概要 + 事件
+        # 省的是「每轮重放」的静态重复 token（热会话实测占 memory-context 约 49%）。
+        # K 越小越安全：压缩保留的尾部窗口 protect_last_n=6 ≈ 最近 3 轮，K≤3 时画像永不断。
+        self._head_inject_policy = str(
+            cfg.get("head_inject_policy", os.environ.get("MEMOBASE_HEAD_INJECT_POLICY", "always")) or "always"
+        ).strip().lower()
+        if self._head_inject_policy not in ("always", "periodic"):
+            self._head_inject_policy = "always"
+        self._head_periodic_k = max(
+            1,
+            _cfg_int(cfg.get("head_inject_periodic_k", os.environ.get("MEMOBASE_HEAD_PERIODIC_K", 5)), 5),
+        )
+        # per-session 轮次计数（periodic 用）；重启后归零 = 首轮必带 head，安全侧偏差
+        self._head_counters: Dict[str, int] = {}
+        # Anchor backfill config (FR-019)
+        self._anchor_backfill_enabled = _as_bool(
+            cfg.get("anchor_backfill_enabled", os.environ.get("MEMOBASE_ANCHOR_ENABLED", True)), True
+        )
+        self._anchor_topk = _cfg_int(
+            cfg.get("anchor_topk", os.environ.get("MEMOBASE_ANCHOR_TOPK", 2)), 2
+        )
+        self._anchor_events_per_day = _cfg_int(
+            cfg.get("anchor_events_per_day", os.environ.get("MEMOBASE_ANCHOR_EVENTS_PER_DAY", 2)), 2
+        )
+        self._anchor_budget_tokens = _cfg_int(
+            cfg.get("anchor_budget_tokens", os.environ.get("MEMOBASE_ANCHOR_BUDGET_TOKENS", 200)), 200
         )
         self._event_cache_ttl = float(cfg.get("event_cache_ttl", os.environ.get("MEMOBASE_EVENT_CACHE_TTL", 300)))
+        # events 接近上限时调这两个（events > 1500 就该调；改后重启 Hermes 生效）
+        self._bm25_max_events = _cfg_int(
+            cfg.get("bm25_max_events", os.environ.get("MEMOBASE_BM25_MAX_EVENTS", 2000)), 2000
+        )
+        self._bm25_time_range_days = _cfg_int(
+            cfg.get(
+                "bm25_time_range_days",
+                os.environ.get("MEMOBASE_BM25_TIME_RANGE_DAYS", 3650),
+            ),
+            3650,
+        )
 
         # Temporal boost config (P0-A)
         self._temporal_boost_enabled = _as_bool(
@@ -309,17 +423,8 @@ class MemobaseMemoryProvider(MemoryProvider):
             cfg.get("rerank_ratio_threshold", os.environ.get("MEMOBASE_RERANK_RATIO", 1.01))
         )
         # P1-3 防御：None/空串不崩溃，int 解析失败回退默认
-        def _cfg_int(key, env_var, default):
-            v = cfg.get(key)
-            if v is None:
-                v = os.environ.get(env_var, default)
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                return default
-
-        self._rerank_topk = _cfg_int("rerank_topk", "MEMOBASE_RERANK_TOPK", 15)
-        self._rerank_keep = _cfg_int("rerank_keep", "MEMOBASE_RERANK_KEEP", 8)
+        self._rerank_topk = _cfg_int(cfg.get("rerank_topk", os.environ.get("MEMOBASE_RERANK_TOPK", 15)), 15)
+        self._rerank_keep = _cfg_int(cfg.get("rerank_keep", os.environ.get("MEMOBASE_RERANK_KEEP", 8)), 8)
         self._rerank_overlap_threshold = float(
             cfg.get("rerank_overlap_threshold", os.environ.get("MEMOBASE_RERANK_OVERLAP", 0.3))
         )
@@ -331,6 +436,19 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._api_key = os.environ.get("MEMOBASE_API_KEY") or None
         user_name = os.environ.get("MEMOBASE_USER_NAME", _DEFAULT_USER_NAME)
         self._user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, user_name + "memobase_client"))
+        # Role attribution: the assistant's turns are context for understanding the
+        # conversation, not statements about the user. Sending them to profile
+        # extraction causes assistant-authored text (task briefs, plans, "you are X")
+        # to be stored as the user's own facts.
+        # Default True preserves upstream behaviour; set MEMOBASE_SEND_ASSISTANT=false
+        # to send only the user's own turns.
+        self._send_assistant = _as_bool(
+            os.environ.get("MEMOBASE_SEND_ASSISTANT"), default=True
+        )
+        # 纯确认词轮次跳过入库（默认开；设 false 可恢复「原样记录每一轮」）
+        self._skip_ack_turns = _as_bool(
+            os.environ.get("MEMOBASE_SKIP_ACK_TURNS"), default=True
+        )
 
         headers = {}
         if self._api_key:
@@ -338,15 +456,24 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._client = httpx.Client(
             base_url=self._base_url,
             headers=headers,
-            timeout=8.0,
+            # 8s 太紧：memobase 重启后首次检索要先算 query embedding，
+            # 硅基流动冷启动实测有过 12~25s 的抽风（Qwen3-Embedding-8B 时代记录，4B 偶发），
+            # 撞上就整条 hybrid 腿 fallback 成纯向量（2026-10-27 13:40 实测一次）。
+            # hot-path 等待由 _prefetch_wait_secs(5s) 独立控制，调大这里不会让用户等更久。
+            timeout=15.0,
         )
         if self._hybrid_enabled:
             self._store = EventStore(
-                self._client, self._user_id, ttl_secs=self._event_cache_ttl
+                self._client, self._user_id, ttl_secs=self._event_cache_ttl,
+                max_events=self._bm25_max_events,
+                time_range_days=self._bm25_time_range_days,
             )
         logger.info(
-            "[memobase] initialized base=%s user=%s writes=%s",
+            "[memobase] initialized base=%s user=%s writes=%s send_assistant=%s skip_ack=%s",
             self._base_url, self._user_id, self._writes_enabled,
+            getattr(self, "_send_assistant", True),
+            # 打进日志才能在重启后确认「新代码真的上位」（改配置类变更的验收靠数据，不靠进程状态）
+            getattr(self, "_skip_ack_turns", True),
         )
 
     def shutdown(self) -> None:
@@ -368,8 +495,9 @@ class MemobaseMemoryProvider(MemoryProvider):
         return (
             "You have access to a Memobase long-term memory backend. "
             "Relevant memories are injected automatically each turn inside the "
-            "`<memory-context>` block. You can also search on demand with the "
-            "`memobase_search` tool, or list the full user profile with "
+            "`<memory-context>` block. "
+            "Recent summaries come from daily memory compression; if you need specific event details, use `memobase_search` with the `date` parameter (YYYY-MM-DD). "
+            "You can also search on demand with the `memobase_search` tool, or list the full user profile with "
             "`memobase_profile`."
         )
 
@@ -422,7 +550,7 @@ class MemobaseMemoryProvider(MemoryProvider):
         self._record_success()
         return ctx.strip()
 
-    def _call_context(self, query: str) -> str:
+    def _call_context(self, query: str, session_id: str = "") -> str:
         """Hybrid recall (BM25 + vector RRF) with automatic vector fallback.
 
         The vector path (context API) is still the source of truth for the
@@ -432,12 +560,89 @@ class MemobaseMemoryProvider(MemoryProvider):
         if not self._hybrid_enabled or self._store is None:
             return self._call_context_vector(query)
         try:
-            return self._call_context_hybrid(query)
+            return self._call_context_hybrid(query, session_id=session_id)
         except Exception as exc:
             logger.warning("[memobase] hybrid recall failed, fallback to vector: %s", exc)
             return self._call_context_vector(query)
 
-    def _call_context_hybrid(self, query: str) -> str:
+    def _fetch_summaries_dual_path(
+        self, query: str, time_window: Optional[Tuple[int, int]]
+    ) -> List[Dict[str, Any]]:
+        """FR-011: 双路检索概要文档（语义路 + 时间直通路），去重合并后返回最多 summary_topk 个。"""
+        if self._client is None or self._user_id is None:
+            return []
+
+        direct_summaries: List[Dict[str, Any]] = []
+        semantic_summaries: List[Dict[str, Any]] = []
+
+        # 1. 直通路 (b): parse_time_window 换算为日期范围
+        if time_window is not None:
+            try:
+                min_age, max_age = time_window
+                now_date = datetime.now(self._tz).date()
+                end_d = now_date - timedelta(days=min_age)
+                start_d = now_date - timedelta(days=max_age)
+                if start_d > end_d:
+                    start_d, end_d = end_d, start_d
+                r_direct = self._client.get(
+                    f"/users/summary/{self._user_id}",
+                    params={
+                        "start_date": start_d.strftime("%Y-%m-%d"),
+                        "end_date": end_d.strftime("%Y-%m-%d"),
+                        "kind": "daily",
+                    },
+                )
+                r_direct.raise_for_status()
+                d_data = r_direct.json()
+                if not d_data.get("errno", 0):
+                    s_list = (d_data.get("data") or {}).get("summaries") or []
+                    # 按日期倒序排（最近日期优先）
+                    direct_summaries = sorted(
+                        s_list,
+                        key=lambda s: str(s.get("summary_date", "")),
+                        reverse=True,
+                    )
+            except Exception as exc:
+                logger.warning("[memobase] direct summary retrieval error: %s", exc)
+                direct_summaries = []
+
+        # 2. 语义路 (a): GET /users/summary/search/{uid}
+        try:
+            r_sem = self._client.get(
+                f"/users/summary/search/{self._user_id}",
+                params={
+                    "query": query,
+                    "topk": str(self._summary_semantic_topk),
+                    "kind": "daily",
+                },
+            )
+            r_sem.raise_for_status()
+            sem_data = r_sem.json()
+            if not sem_data.get("errno", 0):
+                semantic_summaries = (sem_data.get("data") or {}).get("summaries") or []
+        except Exception as exc:
+            logger.warning("[memobase] semantic summary search error: %s", exc)
+            semantic_summaries = []
+
+        # 3. 按 summary_date 去重合并：直通路优先保时间命中，再补语义路命中
+        merged: List[Dict[str, Any]] = []
+        seen_dates: Set[str] = set()
+
+        for s in direct_summaries:
+            s_date = str(s.get("summary_date", "")).strip()
+            if s_date and s_date not in seen_dates:
+                seen_dates.add(s_date)
+                merged.append(s)
+
+        for s in semantic_summaries:
+            s_date = str(s.get("summary_date", "")).strip()
+            if s_date and s_date not in seen_dates:
+                seen_dates.add(s_date)
+                merged.append(s)
+
+        return merged[: self._summary_topk]
+
+    def _call_context_hybrid(self, query: str, session_id: str = "") -> str:
         """Run BM25 + vector legs, fuse with RRF, rebuild the event section.
 
         Both legs operate on the SAME id space (event id): the vector leg is
@@ -448,6 +653,101 @@ class MemobaseMemoryProvider(MemoryProvider):
         if self._client is None or self._user_id is None:
             return ""
         query = query[:_MAX_QUERY_CHARS]
+
+        # FR-012: 一次性解析时间窗，直通路与事件腿 temporal boost 共用
+        time_window = parse_time_window(query)
+
+        # 共享跨段行级去重集合 (FR-015)
+        seen_lines: Set[str] = set()
+        summary_lines: List[str] = []
+        used_summary = 0
+        summaries: List[Dict[str, Any]] = []
+
+        # FR-011 / FR-013 / FR-016: 文档段组装（flag 开启时执行，异常 fail-open）
+        if self._summary_enabled:
+            try:
+                summaries = self._fetch_summaries_dual_path(query, time_window)
+                # 单日窗预算放宽（Q5-1：直通只命中 1 天时 350 明显不够，30 事件 ≈1500+ 字符）
+                single_day = time_window is not None and (time_window[1] - time_window[0]) <= 1
+                summary_budget = self._summary_single_day_budget if single_day else self._summary_budget_tokens
+                for doc in summaries:
+                    d_str = str(doc.get("summary_date", "")).strip()
+                    if not d_str:
+                        continue
+                    try:
+                        dt = datetime.strptime(d_str, "%Y-%m-%d").date()
+                        m_d = f"{dt.month}/{dt.day}"
+                    except Exception:
+                        m_d = d_str
+
+                    eids = doc.get("event_ids") or []
+                    n_events = len(eids)
+                    header_line = f"【{m_d} 概要】（当日 {n_events} 事件，细节可查 memobase_search date={d_str}）"
+
+                    if used_summary + len(header_line) > summary_budget and summary_lines:
+                        break
+                    summary_lines.append(header_line)
+                    used_summary += len(header_line)
+
+                    # 概要 content 行级渲染 (FR-013) + 行级 BM25 排序（Q5-1：#21 截断正解）
+                    content = doc.get("content") or ""
+                    strip_chars = "-*• \t"
+                    raw_lines = []
+                    for ln in content.splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        disp = f"- {ln.lstrip(strip_chars)}"
+                        if disp in seen_lines:
+                            continue
+                        raw_lines.append(disp)
+                    if len(raw_lines) > 1:
+                        try:
+                            bm = BM25Index()
+                            bm.build(raw_lines)
+                            scored = bm.score(query)
+                            if scored:
+                                raw_lines = [raw_lines[i] for i, _ in sorted(scored, key=lambda kv: -kv[1])]
+                            # scored 为空（查询词与概要行无 bigram 重叠）保持原序，防内容行全丢
+                        except Exception:
+                            pass  # BM25 排序失败保持原序（fail-open）
+                    for disp in raw_lines:
+                        seen_lines.add(disp)
+                        if used_summary + len(disp) > summary_budget and summary_lines:
+                            break
+                        summary_lines.append(disp)
+                        used_summary += len(disp)
+            except Exception as exc:
+                logger.warning("[memobase] summary segment build failed, fail-open: %s", exc)
+                summary_lines = []
+                used_summary = 0
+                summaries = []
+
+        # FR-019: 锚点提取（纯语义查询才启用；有时间词 → 直通路已覆盖，跳过保证幂等）
+        anchor_dates: List[str] = []
+        if self._anchor_backfill_enabled and time_window is None and summaries:
+            anchor_dates = [
+                str(s["summary_date"]).strip()
+                for s in summaries
+                if str(s.get("summary_date", "")).strip()
+            ][: self._anchor_topk]
+            # P2-3：锚点提取处加 debug 日志，区分「锚点日均已覆盖」和「代码没执行」
+            logger.debug(
+                "[memobase] anchor extraction: %d dates (anchors=%s, time_window=%s)",
+                len(anchor_dates),
+                anchor_dates,
+                time_window,
+            )
+
+        # FR-014 / FR-016: 事件段预算与让渡逻辑
+        if self._summary_enabled:
+            if summary_lines:
+                event_budget = self._event_budget_tokens
+            else:
+                # 概要段无命中或异常，预算让渡给事件段
+                event_budget = self._event_budget_tokens + self._summary_budget_tokens
+        else:
+            event_budget = self._event_budget_tokens
 
         # --- vector leg: event-level semantic search (event ids) ---
         vec_hits: List[Tuple[str, str]] = []
@@ -493,37 +793,35 @@ class MemobaseMemoryProvider(MemoryProvider):
         fused_scored = rrf_fusion_scored([vec_ids, bm25_ids, entity_ids])
         raw_fused_scored = fused_scored
 
-        # --- Temporal boost (P0-A) ---
-        if self._temporal_boost_enabled and self._store is not None:
+        # --- Temporal boost (P0-A, FR-012: 共用 time_window) ---
+        if self._temporal_boost_enabled and self._store is not None and time_window is not None:
             try:
-                window = parse_time_window(query)
-                if window:
-                    now_date = datetime.now(self._tz).date()
-                    boosted: List[Tuple[str, float]] = []
-                    for eid, s in fused_scored:
-                        t = self._store.time_for(eid)
-                        if t is not None:
-                            try:
-                                ev_date = datetime.fromtimestamp(t, tz=self._tz).date()
-                                age_days = float((now_date - ev_date).days)
-                                f = temporal_factor(
-                                    age_days,
-                                    window,
-                                    gain=self._temporal_gain,
-                                    half_life_days=self._temporal_half_life_days,
-                                    floor=self._temporal_floor,
-                                )
-                            except Exception:
-                                f = 1.0
-                        else:
+                now_date = datetime.now(self._tz).date()
+                boosted: List[Tuple[str, float]] = []
+                for eid, s in fused_scored:
+                    t = self._store.time_for(eid)
+                    if t is not None:
+                        try:
+                            ev_date = datetime.fromtimestamp(t, tz=self._tz).date()
+                            age_days = float((now_date - ev_date).days)
+                            f = temporal_factor(
+                                age_days,
+                                time_window,
+                                gain=self._temporal_gain,
+                                half_life_days=self._temporal_half_life_days,
+                                floor=self._temporal_floor,
+                            )
+                        except Exception:
                             f = 1.0
-                        boosted.append((eid, s * f))
-                    boosted.sort(key=lambda kv: kv[1], reverse=True)
-                    fused_scored = boosted
-                    logger.info(
-                        "[memobase] temporal boost applied (window=%s, gain=%.2f, candidates=%d)",
-                        window, self._temporal_gain, len(boosted),
-                    )
+                    else:
+                        f = 1.0
+                    boosted.append((eid, s * f))
+                boosted.sort(key=lambda kv: kv[1], reverse=True)
+                fused_scored = boosted
+                logger.info(
+                    "[memobase] temporal boost applied (window=%s, gain=%.2f, candidates=%d)",
+                    time_window, self._temporal_gain, len(boosted),
+                )
             except Exception as exc:
                 logger.warning("[memobase] temporal boost error, skip: %s", exc)
 
@@ -602,13 +900,22 @@ class MemobaseMemoryProvider(MemoryProvider):
             if len(rows) >= self._hybrid_keep:
                 break
         if not rows:
+            # P1-5：事件腿全空时锚点仍要兜底（纯语义查询 + 概要命中时恰是锚点最该介入的场景）
+            if anchor_dates and self._summary_enabled and self._anchor_backfill_enabled and self._store is not None:
+                lines, used, seen_lines = self._anchor_backfill(
+                    anchor_dates, [], fused, [], 0, seen_lines, event_budget
+                )
+                if lines:
+                    return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None, session_id=session_id)
+            if summary_lines:
+                return self._finalize_hybrid(query, [], summary_lines, session_id=session_id)
             return self._call_context_vector(query)
 
         # --- rebuild event section under the token budget (line-level dedupe) ---
         lines: List[str] = []
-        seen_lines: set = set()
         used = 0
         for _eid, txt in rows:
+            budget_exceeded = False
             for ln in txt.splitlines():
                 ln = ln.strip()
                 if not ln:
@@ -618,26 +925,250 @@ class MemobaseMemoryProvider(MemoryProvider):
                 if disp in seen_lines:
                     continue
                 seen_lines.add(disp)
-                if used + len(disp) > self._hybrid_event_budget_tokens and lines:
-                    return self._finalize_hybrid(query, lines)
+                if used + len(disp) > event_budget and lines:
+                    budget_exceeded = True
+                    break
                 lines.append(disp)
                 used += len(disp)
-        return self._finalize_hybrid(query, lines)
+            if budget_exceeded:
+                break
+
+        # FR-019: 锚点保底注入（纯语义查询且存在缺失锚点日事件时追加）
+        if anchor_dates and self._summary_enabled and self._anchor_backfill_enabled and self._store is not None:
+            lines, used, seen_lines = self._anchor_backfill(
+                anchor_dates, rows, fused, lines, used, seen_lines, event_budget
+            )
+
+        return self._finalize_hybrid(query, lines, summary_lines if self._summary_enabled else None, session_id=session_id)
+
+    def _anchor_backfill(
+        self,
+        anchor_dates: List[str],
+        rows: List[Tuple[str, str]],
+        fused: List[str],
+        lines: List[str],
+        used: int,
+        seen_lines: Set[str],
+        event_budget: int,
+    ) -> Tuple[List[str], int, Set[str]]:
+        """FR-019 锚点保底注入：锚点日事件缺场时用剩余预算补 top2/日。
+
+        纯追加不改排名；任何异常回滚到调用前状态（fail-open）。
+        P1-5：抽成独立方法，rows 为空（事件腿全空）时也能兜底。
+        """
+        orig_lines = list(lines)
+        orig_used = used
+        orig_seen_lines = set(seen_lines)
+        try:
+            injected_dates = {
+                self._store.date_for(eid, tz=self._tz)
+                for eid, _ in rows
+            }
+            injected_dates.discard(None)
+            missing = [d for d in anchor_dates if d not in injected_dates]
+            if missing:
+                cand = []
+                seen_cand = {eid for eid, _ in rows}
+                rank_map = {eid: i for i, eid in enumerate(fused)}
+                for d in missing:
+                    day_evs = self._store.events_for_date(d, tz=self._tz)
+                    day_evs.sort(
+                        key=lambda e: (0, rank_map[e[0]]) if e[0] in rank_map else (1, -(self._store.time_for(e[0]) or 0.0))
+                    )
+                    added_for_day = 0
+                    for eid, _ in day_evs:
+                        if eid in seen_cand:
+                            continue
+                        seen_cand.add(eid)
+                        cand.append(eid)
+                        added_for_day += 1
+                        if added_for_day >= self._anchor_events_per_day:
+                            break
+                # FR-019 fix（2026-09-03）：锚点预算独立，不再被事件腿挤占
+                # 原逻辑 budget_left = min(event_budget - used, anchor_budget) 在事件腿
+                # 吃满预算（used≈850）时只剩个位数 token，锚点全被挡掉（79% 0 appended）。
+                # 锚点是「时间敏感查询的缺失日保底」，不该跟日常检索抢同一池子；
+                # 独立预算最多 +200 字符/次，换取缺失日事件真正可补。
+                budget_left = self._anchor_budget_tokens
+                strip_chars = "-*• \t"
+                n_appended = 0
+                for eid in cand:
+                    txt = self._store.text_for(eid)
+                    if not txt:
+                        continue
+                    event_added = False
+                    for ln in txt.splitlines():
+                        ln = ln.strip()
+                        if not ln:
+                            continue
+                        disp = f"- {ln.lstrip(strip_chars)}"
+                        if disp in seen_lines:
+                            continue
+                        if budget_left - len(disp) < 0:
+                            break
+                        seen_lines.add(disp)
+                        lines.append(disp)
+                        budget_left -= len(disp)
+                        used += len(disp)
+                        event_added = True
+                    if event_added:
+                        n_appended += 1
+                    if budget_left <= 0:
+                        break
+                logger.info(
+                    "[memobase] anchor backfill: %d days missing, %d events appended (anchors=%s)",
+                    len(missing),
+                    n_appended,
+                    anchor_dates,
+                )
+        except Exception as exc:
+            logger.warning("[memobase] anchor backfill failed, fail-open: %s", exc)
+            lines = orig_lines
+            used = orig_used
+            seen_lines = orig_seen_lines
+        return lines, used, seen_lines
 
     _EVENT_HEADER_RE = re.compile(r"## (?:过去事件|Past Events|Events)[：:]?\s*")
 
-    def _finalize_hybrid(self, query: str, lines: List[str]) -> str:
+    def _should_inject_head(self, session_id: str) -> bool:
+        """This turn's memory-context 是否带静态 head（画像 / 记忆块）。
+
+        Hermes 把拼好的 block 写进 user 行的 api_content 并「每轮原样重放」，
+        所以常开的 head 是每轮都在付费的固定开销。``periodic`` 下每 K 轮才带一次，
+        概要层与事件层完全不受影响；画像在压缩中被挤掉后最多 K 轮自愈，
+        ``memobase_search`` 工具任何时候都能拿到完整画像兜底。
+        """
+        if self._head_inject_policy != "periodic":
+            return True
+        if not session_id:
+            # 没有会话上下文（memobase_search 工具调用等）→ 永远带完整 head：
+            # 工具是「拉得到画像」的最后兜底，不能跟着周期策略一起省。
+            return True
+        with self._lock:
+            tick = self._head_counters.get(session_id, 0)
+            self._head_counters[session_id] = tick + 1
+        return tick % self._head_periodic_k == 0
+
+    def _finalize_hybrid(
+        self,
+        query: str,
+        lines: List[str],
+        summary_lines: Optional[List[str]] = None,
+        session_id: str = "",
+    ) -> str:
         """Attach the mixed event section to the vector context's profile part."""
         logger.info(
-            "[memobase] hybrid recall OK: %d event lines (query=%s...)",
+            "[memobase] hybrid recall OK: %d summary lines, %d event lines (query=%s...)",
+            len(summary_lines or []),
             len(lines),
             query[:30],
         )
         base = self._call_context_vector(query, _with_events=False)
         head = self._EVENT_HEADER_RE.split(base, maxsplit=1)[0]
-        new_ctx = f"{head}## 过去事件：\n" + "\n".join(lines)
+        if not self._should_inject_head(session_id):
+            head = ""
+        summary_part = ""
+        if summary_lines:
+            summary_part = "## 近期概要：\n" + "\n".join(summary_lines) + "\n\n"
+        event_part = ""
+        if lines:
+            event_part = "## 过去事件：\n" + "\n".join(lines)
+        new_ctx = f"{head}{summary_part}{event_part}"
         self._record_success()
         return new_ctx.strip()
+
+    # ------------------------------------------------------------------ #
+    # Extra profile sources — read-time union of OTHER memobase users.
+    #
+    # Why: an external chat client (e.g. Open WebUI) writes to its own memobase
+    # user, so ITS EVENTS never leak into this session's timeline (event
+    # isolation is a hard requirement — otherwise the agent recalls them as its
+    # own experience). But the PROFILE layer is shared: we read the other
+    # user's profile and inject it with an explicit source label, so the agent
+    # knows "she is into X *over there*" without pretending it happened here.
+    #
+    # Config ($HERMES_HOME/memobase.json):
+    #   "extra_profile_sources": [
+    #     {"name": "momo-owui", "label": "Open WebUI 侧", "max_items": 8, "max_chars": 600}
+    #   ]
+    # ------------------------------------------------------------------ #
+    _EXTRA_PROFILE_TTL = 300.0
+
+    def _extra_profile_specs(self) -> List[Dict[str, Any]]:
+        cached = getattr(self, "_extra_specs", None)
+        if cached is not None:
+            return cached
+        specs: List[Dict[str, Any]] = []
+        try:
+            home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            raw = _load_json_config(home).get("extra_profile_sources") or []
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                specs.append(
+                    {
+                        "name": name,
+                        "label": str(item.get("label") or name).strip(),
+                        "max_items": _cfg_int(item.get("max_items"), 8) or 8,
+                        "max_chars": _cfg_int(item.get("max_chars"), 600) or 600,
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[memobase] extra_profile_sources unreadable: %s", exc)
+        self._extra_specs = specs
+        return specs
+
+    def _extra_profile_block(self) -> str:
+        """Render other users' profiles as a labelled, read-only block."""
+        specs = self._extra_profile_specs()
+        if not specs or self._client is None:
+            return ""
+        now = time.time()
+        cached = getattr(self, "_extra_block_cache", None)
+        if cached and now - cached[0] < self._EXTRA_PROFILE_TTL:
+            return cached[1]
+        parts: List[str] = []
+        for spec in specs:
+            try:
+                uid = str(uuid.uuid5(uuid.NAMESPACE_DNS, spec["name"] + "memobase_client"))
+                r = self._client.get(f"/users/profile/{uid}")
+                r.raise_for_status()
+                data = r.json() or {}
+                if data.get("errno"):
+                    logger.warning("[memobase] extra profile %s errno=%s", spec["name"], data.get("errno"))
+                    continue
+                entries = ((data.get("data") or {}).get("profiles") or [])
+                entries.sort(
+                    key=lambda e: str(e.get("updated_at") or e.get("created_at") or ""),
+                    reverse=True,
+                )
+                lines: List[str] = []
+                budget = spec["max_chars"]
+                for e in entries[: spec["max_items"]]:
+                    text = str(e.get("content") or "").strip()
+                    if not text:
+                        continue
+                    attr = e.get("attributes") or {}
+                    tag = "/".join(x for x in (attr.get("topic"), attr.get("sub_topic")) if x)
+                    line = f"- {text}" + (f"（{tag}）" if tag else "")
+                    if len(line) > budget:
+                        break
+                    budget -= len(line)
+                    lines.append(line)
+                if lines:
+                    parts.append(
+                        f"[{spec['label']}画像 · 只读参考，不是本会话/本端经历，别当成自己做过的事]\n"
+                        + "\n".join(lines)
+                    )
+                logger.info("[memobase] extra profile injected label=%s items=%d", spec["label"], len(lines))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[memobase] extra profile %s failed: %s", spec["name"], exc)
+        block = "\n\n".join(parts)
+        self._extra_block_cache = (now, block)
+        return block
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Recall memories for the CURRENT question with a short hot-path wait."""
@@ -671,8 +1202,29 @@ class MemobaseMemoryProvider(MemoryProvider):
             self._prefetch_result = None
 
         def _run() -> None:
+            t0 = time.time()
             try:
-                ctx = self._call_context(query)
+                ctx = self._call_context(query, session_id=session_id)
+                ctx = ctx or ""
+                try:
+                    extra = self._extra_profile_block()
+                except Exception:  # noqa: BLE001 — extra sources must never break recall
+                    extra = ""
+                if extra:
+                    ctx = (ctx + "\n\n" + extra).strip() if ctx else extra
+                dur = time.time() - t0
+                # 观测用（图图 2026-10-27 评估建议）：每轮一行，正常也打（info 级）——
+                # debug 级在 agent.log 里看不到，等于没观测；空召回/慢查询额外带标记。
+                store_docs = 0
+                try:
+                    if self._store is not None:
+                        store_docs = len(getattr(self._store, "_texts", {}) or {})
+                except Exception:                     # noqa: BLE001
+                    pass
+                logger.info("[memobase] prefetch len=%d chars=%d dur=%.2fs bm25_docs=%d%s",
+                            len(query or ""), len(ctx), dur, store_docs,
+                            " EMPTY(疑似漏召回)" if not ctx
+                            else (" SLOW" if dur > 3.0 else ""))
                 with self._lock:
                     if self._prefetch_for_query == query:
                         self._prefetch_result = ctx
@@ -691,7 +1243,9 @@ class MemobaseMemoryProvider(MemoryProvider):
             has = self._prefetch_result is not None
         if not has:
             return None
-        return RecallStatus(provider_label="memobase", count=0, glyph="🧠")
+        return RecallStatus(
+            provider_label=self._recall_label, count=0, glyph=self._recall_glyph
+        )
 
     # ------------------------------------------------------------------ #
     # Turn sync (writes)
@@ -721,18 +1275,27 @@ class MemobaseMemoryProvider(MemoryProvider):
             return
         if self._client is None or self._user_id is None:
             return
+        # 纯确认词轮次（「好」「继续」「嗯嗯」）不入库：服务端没有信息量门槛，
+        # 这类轮次成批 flush 会产出「用户表达了同意和确认的态度」这类空转事件
+        # 并进画像（2026-11-04 人造样本实测）。带决策的短句（「好，那就这么办吧」）
+        # 不在此列 —— 判据见 turn_filters.is_ack_only_turn。
+        if getattr(self, "_skip_ack_turns", True) and is_ack_only_turn(user_content):
+            logger.info("[memobase] skip ack-only turn: %r", user_content[:20])
+            return
 
         def _sync() -> None:
             try:
-                body = {
-                    "blob_type": "chat",
-                    "blob_data": {
-                        "messages": [
-                            {"role": "user", "content": user_content[:_MAX_QUERY_CHARS * 2]},
-                            {"role": "assistant", "content": assistant_content[:_MAX_QUERY_CHARS * 2]},
-                        ]
-                    },
-                }
+                messages = [
+                    {"role": "user", "content": user_content[:_MAX_QUERY_CHARS * 2]},
+                ]
+                if self._send_assistant:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": assistant_content[:_MAX_QUERY_CHARS * 2],
+                        }
+                    )
+                body = {"blob_type": "chat", "blob_data": {"messages": messages}}
                 r = self._client.post(
                     f"/blobs/insert/{self._user_id}?wait_process=false",
                     json=body,
@@ -772,6 +1335,10 @@ class MemobaseMemoryProvider(MemoryProvider):
                             "type": "string",
                             "description": "Natural-language search query.",
                         },
+                        "date": {
+                            "type": "string",
+                            "description": "Optional date in YYYY-MM-DD format to retrieve all raw event details for that day.",
+                        },
                         "max_length": {
                             "type": "integer",
                             "description": "Max context characters (default 2000).",
@@ -793,9 +1360,51 @@ class MemobaseMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs: Any) -> str:
         if tool_name == "memobase_search":
             query = (args or {}).get("query", "")
+            date_arg = (args or {}).get("date")
             max_len = int((args or {}).get("max_length", 2000))
             if self._breaker_open():
                 return json.dumps({"error": "Memobase temporarily unavailable"}, ensure_ascii=False)
+
+            # FR-017: 带 date 参数时从 EventStore 本地按日过滤
+            if date_arg:
+                try:
+                    target_date = datetime.strptime(str(date_arg).strip(), "%Y-%m-%d").date()
+                    if self._store is None and self._client is not None and self._user_id is not None:
+                        self._store = EventStore(self._client, self._user_id, ttl_secs=self._event_cache_ttl,
+                                                 max_events=self._bm25_max_events,
+                                                 time_range_days=self._bm25_time_range_days)
+
+                    if self._store is not None:
+                        self._store.refresh()
+                        events_for_date = self._store.events_for_date(target_date, tz=self._tz)
+                    else:
+                        events_for_date = []
+
+                    if not events_for_date:
+                        return json.dumps(
+                            {"note": f"No events found for date {date_arg}."},
+                            ensure_ascii=False,
+                        )
+
+                    lines = []
+                    strip_chars = "-*• \t"
+                    for _, txt in events_for_date:
+                        for ln in txt.splitlines():
+                            ln = ln.strip()
+                            if not ln:
+                                continue
+                            disp = f"- {ln.lstrip(strip_chars)}"
+                            lines.append(disp)
+
+                    ctx = f"## {date_arg} 事件细节（共 {len(events_for_date)} 条事件）：\n" + "\n".join(lines)
+                    if max_len and len(ctx) > max_len:
+                        ctx = ctx[:max_len]
+                    return json.dumps({"context": ctx}, ensure_ascii=False)
+                except Exception as exc:
+                    logger.warning("[memobase] memobase_search with date failed: %s", exc)
+                    return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+            # 不带 date 参数时行为与 v3 逐字节一致
             try:
                 ctx = self._call_context(query)
                 if max_len and len(ctx) > max_len:

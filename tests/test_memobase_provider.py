@@ -454,3 +454,106 @@ class TestRerankIsOptIn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRecallLabelConfig(unittest.TestCase):
+    """The recall indicator is branded via config, not hardcoded.
+
+    The public build shows the provider name; a deployment can override it.
+    """
+
+    def _init(self, **cfg):
+        with tempfile.TemporaryDirectory() as home:
+            if cfg:
+                with open(os.path.join(home, "memobase.json"), "w", encoding="utf-8") as fh:
+                    json.dump(cfg, fh, ensure_ascii=False)
+            p, _ = _make_provider()
+            with mock.patch.dict(os.environ, {"MEMOBASE_BASE_URL": BASE_URL}, clear=False):
+                p.initialize(session_id="s", hermes_home=home, agent_context="primary")
+            return p
+
+    def test_default_label_is_provider_name(self):
+        p = self._init()
+        self.assertEqual(p._recall_label, "memobase")
+        self.assertEqual(p._recall_glyph, "🧠")
+
+    def test_config_overrides_label_and_glyph(self):
+        p = self._init(recall_label="my-memory", recall_glyph="💭")
+        self.assertEqual(p._recall_label, "my-memory")
+        self.assertEqual(p._recall_glyph, "💭")
+
+    def test_blank_config_falls_back_to_default(self):
+        p = self._init(recall_label="   ", recall_glyph="")
+        self.assertEqual(p._recall_label, "memobase")
+        self.assertEqual(p._recall_glyph, "🧠")
+
+    def test_recall_status_uses_configured_label(self):
+        p = self._init(recall_label="my-memory", recall_glyph="💭")
+        p._prefetch_result = "some context"
+        status = p.recall_status()
+        self.assertIsNotNone(status)
+        self.assertEqual(status.provider_label, "my-memory")
+        self.assertEqual(status.glyph, "💭")
+
+
+class TestHeadInjectPolicy(unittest.TestCase):
+    """静态 head 周期注入（图图 2026-10-27 评估 D / K=5 定稿）。
+
+    动机：Hermes 把拼好的 memory-context 写进 user 行的 api_content 并每轮原样重放，
+    常开的 profile head 是每轮都在付费的固定开销。periodic 下每 K 轮带一次，
+    概要层与事件层不受影响。
+    """
+
+    @staticmethod
+    def _p(policy="periodic", k=5):
+        p = MemobaseMemoryProvider()
+        p._head_inject_policy = policy
+        p._head_periodic_k = k
+        p._head_counters = {}
+        return p
+
+    def test_always_policy_injects_every_turn_and_never_counts(self):
+        p = self._p(policy="always")
+        self.assertTrue(all(p._should_inject_head("s1") for _ in range(12)))
+        self.assertEqual({}, p._head_counters)
+
+    def test_periodic_injects_first_turn_and_every_kth(self):
+        p = self._p(policy="periodic", k=5)
+        got = [p._should_inject_head("s1") for _ in range(11)]
+        # tick 0..10 -> 第 1、6、11 轮带 head
+        self.assertEqual([0, 5, 10], [i for i, v in enumerate(got) if v])
+
+    def test_counters_are_per_session(self):
+        p = self._p(policy="periodic", k=5)
+        p._should_inject_head("a")   # a -> 1
+        p._should_inject_head("a")   # a -> 2
+        self.assertTrue(p._should_inject_head("b"), "新会话首轮必须带画像")
+        self.assertEqual(2, p._head_counters["a"])
+        self.assertEqual(1, p._head_counters["b"])
+
+    def test_session_less_call_always_gets_head_and_does_not_consume_tick(self):
+        # memobase_search 工具没有会话上下文：必须永远带完整 head，且不推进计数
+        p = self._p(policy="periodic", k=5)
+        p._should_inject_head("s1")          # s1 -> 1
+        for _ in range(7):
+            self.assertTrue(p._should_inject_head(""))
+        self.assertEqual(1, p._head_counters["s1"])
+        self.assertNotIn("", p._head_counters)
+
+    def test_empty_head_is_produced_when_periodic_skips(self):
+        # head 段被跳过时，_finalize_hybrid 仍应输出概要/事件部分而不报错
+        p, _transport = _make_provider(
+            lambda r: httpx.Response(200, json={"errno": 0, "data": {"context": "## 用户当前状态\n- 喜欢抹茶"}})
+        )
+        p._head_inject_policy = "periodic"
+        p._head_periodic_k = 5
+        p._head_counters = {}
+        first = p._finalize_hybrid("q", ["- 事件一"], None, session_id="s1")
+        second = p._finalize_hybrid("q", ["- 事件一"], None, session_id="s1")
+        self.assertIn("喜欢抹茶", first, "第 1 轮应带 head")
+        self.assertNotIn("喜欢抹茶", second, "第 2 轮应跳过 head")
+        self.assertIn("事件一", second, "事件段不受影响")
+
+
+if __name__ == "__main__":
+    unittest.main()
